@@ -598,6 +598,111 @@ def cmd_rollback(args, roots: Roots, log) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Subcommand: clean-backups (Fase 5)
+# ---------------------------------------------------------------------------
+
+_CLEAN_BACKUPS_CONSEQUENCE = (
+    "Menghapus .bak-* menurunkan rollback jalur cepat (undo_swap); "
+    "fallback yang tersisa adalah snapshot di state_home."
+)
+
+
+def cmd_clean_backups(args, roots: Roots, log, *, ask=None, out=None) -> int:
+    """Remove the tool's own `.bak-<ts>` backups (DESIGN §7, Fase 5).
+
+    Standalone only — the in-`switch`/`onboard` cleanup prompt waits for
+    the façade. Read-only classification lives in `backups.py`; this
+    wrapper adds the switch-lock guard, the confirmation prompt and the
+    audit entry. It refuses to run while a switch/rollback holds the lock.
+    """
+    from .backups import BackupError, list_backups, plan_cleanup, remove_backup
+    from .lock import LockError, switch_lock
+    from .log import append_audit
+
+    if out is None:
+        out = print
+    if ask is None:  # pragma: no cover - real terminal input
+        def ask(prompt):
+            return input(prompt)
+
+    keep = getattr(args, "keep", None)
+    if keep is not None and keep < 0:
+        print("error: --keep harus integer >= 0", file=sys.stderr)
+        return 2
+
+    cfg = roots.config_home
+    entries = list_backups(cfg)
+    if not entries:
+        out("tidak ada backup .bak-* untuk dibersihkan.")
+        return 0
+
+    to_remove = plan_cleanup(entries, keep)
+    remove_paths = {b.path for b in to_remove}
+    kept_n = len(entries) - len(to_remove)
+
+    out(f"backup .bak-* ditemukan: {len(entries)} (config_home={cfg})")
+    for b in entries:
+        mark = "hapus" if b.path in remove_paths else "simpan"
+        out(f"  [{mark}] {b.path}  ({b.kind})")
+    out(_CLEAN_BACKUPS_CONSEQUENCE)
+
+    if not to_remove:
+        out("tidak ada yang dihapus (retensi --keep menyisakan semuanya).")
+        return 0
+
+    # Refuse while a switch/rollback is in progress.
+    try:
+        with switch_lock(roots, timeout_seconds=0.0):
+            pass
+    except LockError as e:
+        print(f"error: switch sedang berlangsung; tidak menghapus apa pun "
+              f"({e})", file=sys.stderr)
+        return 1
+
+    if not getattr(args, "yes", False):
+        try:
+            answer = ask(f"hapus {len(to_remove)} backup? [y/N]: ")
+        except EOFError:
+            out("input berakhir (EOF); dibatalkan tanpa menghapus.")
+            return 0
+        if answer.strip().lower() not in ("y", "yes"):
+            out("dibatalkan tanpa menghapus.")
+            return 0
+
+    removed: list[str] = []
+    failed: list[dict] = []
+    try:
+        # Re-acquire for the actual removal: a switch may have started
+        # between the probe above and the confirmation.
+        with switch_lock(roots, timeout_seconds=0.0):
+            for b in to_remove:
+                try:
+                    remove_backup(b.path, cfg)
+                    removed.append(b.path)
+                except (BackupError, OSError) as e:
+                    failed.append({"path": b.path, "error": str(e)})
+    except LockError as e:
+        print(f"error: switch sedang berlangsung; tidak menghapus apa pun "
+              f"({e})", file=sys.stderr)
+        return 1
+
+    try:
+        append_audit(roots, {
+            "action": "cleanup",
+            "removed": removed,
+            "failed": failed,
+        })
+    except Exception:
+        pass
+
+    out(f"dihapus: {len(removed)}; gagal: {len(failed)}; disimpan: {kept_n}.")
+    for f in failed:
+        print(f"error: gagal menghapus {f['path']}: {f['error']}",
+              file=sys.stderr)
+    return 1 if failed else 0
+
+
+# ---------------------------------------------------------------------------
 # Subcommand: apply (Slice 3)
 # ---------------------------------------------------------------------------
 
@@ -1324,6 +1429,15 @@ def build_parser() -> argparse.ArgumentParser:
                     default=False,
                     help="bypass the ~/.config/hypr/ path-safety check")
 
+    cb = sub.add_parser(
+        "clean-backups",
+        help="remove the tool's own .bak-<ts> backups under config_home",
+    )
+    cb.add_argument("--keep", type=int, default=None,
+                    help="keep the N newest backups (default: remove all)")
+    cb.add_argument("--yes", action="store_true", default=False,
+                    help="skip the confirmation prompt")
+
     return p
 
 
@@ -1351,6 +1465,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "generate": cmd_generate,
         "diff": cmd_diff,
         "edit": cmd_edit,
+        "clean-backups": cmd_clean_backups,
     }
     return table[args.cmd](args, roots, log)
 
