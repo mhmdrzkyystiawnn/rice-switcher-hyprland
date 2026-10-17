@@ -26,9 +26,11 @@ if str(REPO_ROOT) not in sys.path:
 
 from rice_switcher.executor import (
     ExecResult,
+    default_spawner,
     needs_shell,
     run_command,
     run_hook,
+    spawn_command,
     split_command,
 )
 from rice_switcher.lifecycle import (
@@ -95,6 +97,10 @@ class FakeRuntime(Runtime):
             else:
                 self.up.discard(name)
         return ExecResult(tuple(argv), rc, "", "")
+
+    def spawn(self, command, *, timeout=10.0) -> ExecResult:
+        """Model a detached start: record it, apply its effect, no wait."""
+        return self._run([command], timeout)
 
     def _probe(self, c: Component) -> bool:
         return c.name in self.up
@@ -177,6 +183,52 @@ class ExecutorTest(unittest.TestCase):
 
         run_command("qs -c ii", runner=cap)
         self.assertEqual(captured, [["qs", "-c", "ii"]])
+
+    def test_spawn_command_plain_argv(self):
+        captured = []
+
+        def cap(argv, timeout):
+            captured.append(list(argv))
+            return ExecResult(tuple(argv), 0)
+
+        spawn_command("waybar", spawner=cap)
+        self.assertEqual(captured, [["waybar"]])
+
+    def test_spawn_command_shell_fallback(self):
+        captured = []
+
+        def cap(argv, timeout):
+            captured.append(list(argv))
+            return ExecResult(tuple(argv), 0)
+
+        spawn_command("waybar & disown", spawner=cap)
+        self.assertEqual(captured, [["bash", "-lc", "waybar & disown"]])
+
+    def test_spawn_command_noop_does_not_spawn(self):
+        def boom(argv, timeout):
+            raise AssertionError("spawner must not be called for a no-op")
+        self.assertTrue(spawn_command("true", spawner=boom).ok)
+
+    def test_spawn_command_dangerous_pkill_refused(self):
+        def boom(argv, timeout):
+            raise AssertionError("spawner must not be called for pkill -f")
+        res = spawn_command("pkill -f waybar", spawner=boom)
+        self.assertFalse(res.ok)
+
+    def test_default_spawner_does_not_wait_for_exit(self):
+        # `sleep 5` stays alive; a waiting runner would block ~5s. The
+        # spawner must return immediately.
+        import time
+        t0 = time.monotonic()
+        res = default_spawner(["sleep", "5"], 30.0)
+        elapsed = time.monotonic() - t0
+        self.assertTrue(res.ok)
+        self.assertLess(elapsed, 2.0, f"spawn blocked for {elapsed:.2f}s")
+
+    def test_default_spawner_missing_binary(self):
+        res = default_spawner(["/nonexistent-binary-xyz-123"], 1.0)
+        self.assertFalse(res.ok)
+        self.assertEqual(res.rc, 127)
 
 
 # ---------------------------------------------------------------------------
@@ -451,12 +503,15 @@ class SwitchProcessTest(unittest.TestCase):
     def setUp(self):
         self.roots, self._td = _tmp_roots()
         # Live config dirs (the pre-switch state).
-        for d in ("hypr", "quickshell"):
-            os.makedirs(os.path.join(self.roots.config_home, d))
-        # Rice A uses quickshell; rice B uses waybar.
         self.hypr_live = os.path.join(self.roots.config_home, "hypr")
         self.qs_live = os.path.join(self.roots.config_home, "quickshell")
         self.wb_live = os.path.join(self.roots.config_home, "waybar")
+        for d in (self.hypr_live, self.qs_live):
+            os.makedirs(d)
+        # A marker so rollback can be shown to restore CONTENT, not an
+        # empty directory (regression for the tilde-snapshot data-loss).
+        Path(self.hypr_live, "marker").write_text("LIVE-HYPR")
+        # Rice A uses quickshell; rice B uses waybar.
         self._write_rice("A", "quickshell", self.qs_live)
         self._write_rice("B", "waybar", self.wb_live)
         self.a = load_manifest(manifest_path(self.roots, "A"))
@@ -522,6 +577,11 @@ class SwitchProcessTest(unittest.TestCase):
         self.assertEqual(read_state(self.roots).current_rice, "A")
         # The stopped component was restarted during rollback.
         self.assertTrue(rt.ran("quickshell-start"))
+        # Live config CONTENT is restored, not an empty directory.
+        self.assertEqual(Path(self.hypr_live, "marker").read_text(), "LIVE-HYPR")
+        # Hyprland was reloaded again (once on switch, once on rollback)
+        # so the compositor drops B's config.
+        self.assertEqual(rt.commands().count("hyprctl reload"), 2)
 
     def test_processes_skipped_when_disabled(self):
         rt = self._runtime()

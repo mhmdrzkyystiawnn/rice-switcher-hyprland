@@ -339,7 +339,7 @@ class RestoreMissingSnapshotTest(unittest.TestCase):
         from rice_switcher.switch import do_rollback
         from rice_switcher.log import setup_logging
         log = setup_logging(self.roots)
-        ts, errors = do_rollback(self.roots, "2099-01-01T00-00-00_nonexistent", log)
+        ts, errors = do_rollback(self.roots, "2099-01-01T00-00-00_nonexistent", log, reload_fn=lambda: None)
         self.assertEqual(ts, "")
         self.assertTrue(any("not found" in e.lower() or "not found" in e for e in errors),
                         msg=f"expected 'not found' in errors, got {errors}")
@@ -686,7 +686,7 @@ class RollbackUpdatesStateTest(unittest.TestCase):
         from rice_switcher.switch import do_rollback
         ts = outcome_b.snapshot_ts
         self.assertIsNotNone(ts, "snapshot_ts must be set after a real switch")
-        ts_rb, errors_rb = do_rollback(self.roots, ts, None)
+        ts_rb, errors_rb = do_rollback(self.roots, ts, None, reload_fn=lambda: None)
         self.assertEqual(errors_rb, [], f"rollback errors: {errors_rb}")
         st = read_state(self.roots)
         self.assertEqual(st.current_rice, "a",
@@ -718,7 +718,7 @@ class RollbackUpdatesStateTest(unittest.TestCase):
             f.write("MUTATED\n")
         # 4. Rollback
         from rice_switcher.switch import do_rollback
-        rb_ts, errs = do_rollback(self.roots, ts, None)
+        rb_ts, errs = do_rollback(self.roots, ts, None, reload_fn=lambda: None)
         self.assertEqual(rb_ts, ts)
         # The error must mention the missing rice= line
         self.assertTrue(any("rice=" in e for e in errs),

@@ -60,6 +60,7 @@ from rice_switcher.manifest import (
     Component,
     Manifest,
     ManifestError,
+    Meta,
     VALID_TYPES,
     list_manifests,
     load_manifest,
@@ -590,6 +591,47 @@ class SnapshotTest(unittest.TestCase):
         snap = os.path.join(self.roots.state_home, "rice-switcher", "snapshot",
                             ts, "test")
         self.assertTrue(os.path.islink(os.path.join(snap, "dangling")))
+
+    def test_create_pending_expands_tilde_config_link(self):
+        # Regression: a config_link written as `~/.config/hypr` must be
+        # expanded before snapshotting. Otherwise os.path.lexists() sees
+        # no such file, the snapshot silently captures an EMPTY dir, and
+        # rollback wipes the live config (data-loss).
+        from unittest import mock
+        home = os.path.join(self.roots.config_home, "home")
+        hypr = os.path.join(home, ".config", "hypr")
+        os.makedirs(hypr)
+        Path(hypr, "hyprland.lua").write_text("cfg")
+        with mock.patch.dict(os.environ, {"HOME": home}):
+            ts, captured = create_pending(self.roots, ["~/.config/hypr"])
+        self.assertEqual(captured, [hypr])
+        target = os.path.join(pending_path(self.roots, ts), "hypr")
+        self.assertTrue(
+            os.path.isfile(os.path.join(target, "hyprland.lua")),
+            "tilde config_link snapshot must contain the live files",
+        )
+
+
+class GatherConfigLinksTest(unittest.TestCase):
+    def test_expands_user_and_makes_absolute(self):
+        from rice_switcher.switch import _gather_config_links
+        m = Manifest(
+            meta=Meta(name="r", description="d"),
+            components=[Component(name="hyprland", type="compositor",
+                                  config_link="~/.config/hypr")],
+        )
+        self.assertEqual(
+            _gather_config_links(m),
+            [os.path.abspath(os.path.expanduser("~/.config/hypr"))],
+        )
+
+    def test_skips_components_without_config_link(self):
+        from rice_switcher.switch import _gather_config_links
+        m = Manifest(
+            meta=Meta(name="r", description="d"),
+            components=[Component(name="qs", type="shell")],
+        )
+        self.assertEqual(_gather_config_links(m), [])
 
 
 # ---------------------------------------------------------------------------

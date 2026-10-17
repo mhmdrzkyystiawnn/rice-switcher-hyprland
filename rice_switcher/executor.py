@@ -137,6 +137,69 @@ def run_command(
     return run_argv(argv, timeout=timeout, runner=runner)
 
 
+# Keep references to detached children so their Popen objects are not
+# garbage-collected while still running (CPython warns "subprocess ...
+# is still running"). The switcher is a short-lived CLI.
+_LIVE_CHILDREN: list = []
+
+
+def default_spawner(argv: Sequence[str], timeout: float = DEFAULT_TIMEOUT) -> ExecResult:
+    """Start `argv` detached and return immediately (fire and forget).
+
+    `default_runner` waits for the process to exit, which is correct for
+    short commands (stop, reload, hooks) but wrong for component `start`
+    commands: those launch long-running daemons (waybar, quickshell,
+    hypridle). Waiting on a daemon blocks until `timeout` and then kills
+    it, so no daemon could ever start. Here we spawn it in a new session
+    (so it survives the switcher) and let the caller confirm liveness
+    through `Runtime.wait_for(is_running)`. `timeout` is accepted for
+    signature symmetry with the runner but is unused: there is nothing
+    to wait for.
+    """
+    argv = list(argv)
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        _LIVE_CHILDREN.append(proc)
+        return ExecResult(tuple(argv), 0)
+    except FileNotFoundError as e:
+        return ExecResult(tuple(argv), 127, "", str(e))
+    except OSError as e:
+        return ExecResult(tuple(argv), 126, "", str(e))
+
+
+# A spawner receives (argv, timeout) and returns an ExecResult describing
+# whether the process could be started (not how it later exits).
+Spawner = Callable[[Sequence[str], float], ExecResult]
+
+
+def spawn_command(
+    command: str,
+    *,
+    timeout: float = DEFAULT_TIMEOUT,
+    spawner: Spawner | None = None,
+) -> ExecResult:
+    """Start a manifest command detached (see `default_spawner`).
+
+    Mirrors `run_command`'s parsing (empty/`true` no-op, refused `pkill
+    -f`, `bash -lc` fallback) but never waits for the process.
+    """
+    argv, err = split_command(command)
+    if err:
+        return ExecResult((), 2, "", err)
+    if not argv:
+        return ExecResult((), 0, "", "")
+    spawn = spawner or default_spawner
+    if needs_shell(command):
+        return spawn(["bash", "-lc", command], timeout)
+    return spawn(argv, timeout)
+
+
 def run_hook(
     command: str,
     *,

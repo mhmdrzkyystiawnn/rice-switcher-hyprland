@@ -154,6 +154,13 @@ def create_pending(
 
     captured: list[str] = []
     for cl in config_link_paths:
+        # Normalise before touching the filesystem: `os.path.lexists`
+        # does NOT expand `~`, so a config_link written as
+        # `~/.config/hypr` would look non-existent and the snapshot
+        # would silently capture an EMPTY directory. Expand here (and
+        # record the absolute path, so `restore` targets the right
+        # place) to keep snapshots faithful.
+        cl = os.path.abspath(os.path.expanduser(cl))
         # Each config_link gets its own subdir under the snapshot,
         # named after the basename of the config_link.
         name = os.path.basename(cl.rstrip("/")) or "config"

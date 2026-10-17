@@ -18,9 +18,11 @@ The orchestrator respects:
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 from dataclasses import dataclass
 
+from .executor import DEFAULT_TIMEOUT
 from .lifecycle import (
     LifecycleError,
     Runtime,
@@ -71,7 +73,16 @@ class SwitchOutcome:
 # ---------------------------------------------------------------------------
 
 def _gather_config_links(manifest: Manifest) -> list[str]:
-    return [c.config_link for c in manifest.components if c.config_link]
+    # Normalise to absolute paths: manifests may write `~/.config/hypr`,
+    # and both the snapshot and the rollback must operate on the real
+    # location. `os.path.lexists("~/.config/hypr")` is False, so leaving
+    # the tilde would make the snapshot silently empty (data-loss on
+    # rollback).
+    return [
+        os.path.abspath(os.path.expanduser(c.config_link))
+        for c in manifest.components
+        if c.config_link
+    ]
 
 
 def _print_plan(plan: SwitchPlan, roots: Roots) -> str:
@@ -223,6 +234,10 @@ def do_switch(
 
             started: list[Component] = []
             stopped: list[Component] = []
+            # Track whether we reloaded Hyprland, so a rollback can reload
+            # the restored config back into the running compositor.
+            hypr_reloaded = False
+            hypr_reload_cmd = ""
 
             def _audit(kind: str, name: str, command: str, res) -> None:
                 append_audit(roots, {
@@ -275,6 +290,8 @@ def do_switch(
                             reload_component(runtime, c, audit=_audit)
                             if c.name == "hyprland" and c.reload:
                                 reloaded_hypr = True
+                                hypr_reloaded = True
+                                hypr_reload_cmd = c.reload
                     # Reload Hyprland when its config was swapped and the
                     # component did not already carry a reload command.
                     if hypr_swapped and not reloaded_hypr:
@@ -282,6 +299,8 @@ def do_switch(
                         reload_cmd = hypr.reload or "hyprctl reload"
                         res = runtime.run(reload_cmd, timeout=float(hypr.timeout))
                         _audit("reload", "hyprland", reload_cmd, res)
+                        hypr_reloaded = True
+                        hypr_reload_cmd = reload_cmd
                     run_wallpaper(runtime, target_m.wallpaper, audit=_audit)
                     for ident in plan.to_start:
                         c = find_component(ident, all_manifests)
@@ -316,7 +335,8 @@ def do_switch(
                 logger.info("switched to %s (snapshot=%s)", target_name, ts)
             except Exception as e:
                 # Rollback: processes first (best-effort, PLAN.md §3.3),
-                # then the filesystem, then discard the pending snapshot.
+                # then the filesystem, then reload Hyprland so the
+                # running compositor drops the failed target's config.
                 logger.error("switch failed: %s; rolling back", e)
                 if manage_processes:
                     for c in reversed(started):
@@ -329,10 +349,15 @@ def do_switch(
                             start_component(runtime, c, require_running=False)
                         except Exception:
                             pass
-                # Restore each config_link from the pending snapshot.
-                from .snapshot import _copy_tree_symlinks
+                # Restore each config_link. Prefer undoing the exact swap
+                # (the `.bak-<ts>` made by swap_symlink); fall back to the
+                # pending snapshot when there is no backup (the link did
+                # not exist before the swap).
+                from .snapshot import _copy_tree_symlinks, undo_swap
                 for cl in config_links:
                     n = os.path.abspath(os.path.expanduser(cl))
+                    if undo_swap(n):
+                        continue
                     name = os.path.basename(n.rstrip("/")) or "config"
                     src = os.path.join(roots.state_home, "rice-switcher",
                                        "snapshot", f".pending-{ts}", name)
@@ -341,9 +366,18 @@ def do_switch(
                             if os.path.islink(n) or os.path.isfile(n):
                                 os.unlink(n)
                             else:
-                                import shutil
                                 shutil.rmtree(n)
                         _copy_tree_symlinks(src, n)
+                # If the failed switch had reloaded Hyprland, reload the
+                # restored config back in; otherwise the compositor keeps
+                # running the target's (rolled-back) config in memory.
+                if manage_processes and hypr_reloaded:
+                    cmd = hypr_reload_cmd or "hyprctl reload"
+                    try:
+                        res = runtime.run(cmd, timeout=DEFAULT_TIMEOUT)
+                        _audit("reload.rollback", "hyprland", cmd, res)
+                    except Exception:
+                        pass
                 discard_pending(roots, ts)
                 mark_trust(roots, target_name, target_m.source_sha256, status="rolled_back")
                 errors.append(f"switch failed and rolled back: {e}")
@@ -358,7 +392,15 @@ def do_switch(
                         errors=[], warnings=warnings)
 
 
-def do_rollback(roots: Roots, ts: str | None = None, logger=None) -> tuple[str, list[str]]:
+def _default_hypr_reload():
+    """Best-effort `hyprctl reload` used after a rollback restores the
+    compositor config. Imported lazily so tests can inject a no-op."""
+    from .executor import run_argv
+    return run_argv(["hyprctl", "reload"], timeout=DEFAULT_TIMEOUT)
+
+
+def do_rollback(roots: Roots, ts: str | None = None, logger=None, *,
+                reload_fn=None) -> tuple[str, list[str]]:
     """Roll back to a specific (or the latest) committed snapshot."""
     if logger is None:
         logger = setup_logging(roots)
@@ -393,11 +435,25 @@ def do_rollback(roots: Roots, ts: str | None = None, logger=None) -> tuple[str, 
                     "state.current_rice was NOT updated. Inspect and "
                     "adjust manually if needed."
                 )
+            # If the compositor config was restored, reload it: restoring
+            # the files alone leaves the running compositor on the old
+            # (target) config (same class of bug as the failed-switch
+            # rollback).
+            reloaded = False
+            if any(os.path.basename(p.rstrip("/")) in ("hypr", "hyprland")
+                   for p in restored):
+                fn = reload_fn or _default_hypr_reload
+                try:
+                    fn()
+                    reloaded = True
+                except Exception as exc:  # best-effort
+                    logger.warning("compositor reload after rollback failed: %s", exc)
             append_audit(roots, {
                 "action": "rollback",
                 "snapshot": ts,
                 "restored_count": len(restored),
                 "rice": rice_name or None,
+                "compositor_reload": reloaded,
                 "errors": errors,
             })
             return ts, errors

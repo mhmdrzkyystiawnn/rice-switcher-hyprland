@@ -76,11 +76,11 @@ Hyprland has no built-in way to swap between whole desktop setups. If you keep s
 10. **Apply `[theme]`** — cursor via `hyprctl setcursor`, GTK/icon/fonts via `gsettings`, then the optional `theme.apply`.
 11. **Swap each `config_link`** to the target rice's copy; the previous entry is renamed to `<path>.bak-<ts>`.
 12. **Verify** the new Hyprland config (`hyprland --verify-config`), **reload** (`hyprctl reload` plus every command in `to_reload`), and **regenerate colors** (`matugen image <wallpaper>`).
-13. **Start** the components in `to_start` (their `start` command, wait for them to come up, then `health_check` if set).
+13. **Start** the components in `to_start`: each `start` command is spawned **detached** (new session, so a daemon like `waybar` is not killed when the command returns), then `switch` waits for the process to appear (`start_check` or a `/proc` scan) and runs `health_check` if set.
 14. **Run `[hooks] post`**.
 15. **Commit** the pending snapshot, then prune old snapshots (keep 5).
 16. **Update `state.json`** (`current_rice` + trust cache) and append an audit event per executed command.
-17. If anything fails after step 7, the lifecycle is unwound best-effort (started components stopped, stopped components restarted) and the `config_link`s are restored from the pending snapshot; the pending snapshot is discarded, the trust entry is marked `rolled_back`, and the error is returned.
+17. If anything fails after step 7, the lifecycle is unwound best-effort (started components stopped, stopped components restarted), each `config_link` is restored (its `.bak-<ts>` backup via `undo_swap`, else the pending snapshot), Hyprland is reloaded if it had been reloaded, the pending snapshot is discarded, the trust entry is marked `rolled_back`, and the error is returned.
 
 The compositor (`type = "compositor"`) is never stopped or started. Steps 8–14 execute real commands and are **on by default**; set `RICE_TEST=1` (or `--dry-run`) to skip them.
 
@@ -261,7 +261,7 @@ optional = true                      # skipped by validation if `start` has no b
 |---|---|---|
 | `name` | yes | Unique identifier within the rice; used by `depends_on`. |
 | `type` | yes | `compositor`, `shell`, `bar`, `notifications`, `locker`, `wallpaper`, `terminal`, `launcher`, `theme_generator`, `color_daemon`, `clipboard` or `system`. |
-| `start` | yes (unless `optional`) | Command to start the component. `true` is a no-op. Validation only checks the first word against `PATH`. |
+| `start` | yes (unless `optional`) | Command to start the component. `true` is a no-op. Validation only checks the first word against `PATH`. `switch` spawns it detached and then polls for the process. |
 | `stop` | no | Command to stop the component. Defaults to `true`. |
 | `executable` | no | Executable basename for process identity (defaults to `name`). |
 | `argv_match` | no | Tokens that must appear in the process argv, to tell apart e.g. `qs -c ii` from `qs -c minimal`. |
@@ -335,7 +335,7 @@ Runtime state lives in `<RICE_STATE_HOME>/rice-switcher/`: `state.json`, `switch
 
 **Snapshots.** Before any swap, every `config_link` target of the *current* rice is copied into `snapshot/.pending-<ts>/` (symlinks preserved as symlinks, dangling links included; `shutil.copytree(symlinks=True)`, never dereferenced). On success it is renamed to `snapshot/<ts>/` and `snapshot/latest` is updated. The 5 most recent snapshots are kept. Each snapshot stores a `.captured.txt` listing the captured paths and the rice name.
 
-**Rollback.** `switch` rolls back automatically if a step fails after the snapshot is taken: started components are stopped and stopped components are restarted (best-effort), the `config_link`s are restored from the pending snapshot, the pending snapshot is discarded, and `state.json` marks the rice `rolled_back`. `rice-switcher rollback [ts]` restores a committed snapshot manually and re-syncs `current_rice` to the rice recorded in the snapshot. Rollback restores **files, symlinks and (best-effort) processes**; it cannot undo `[hooks]`, `theme.apply` or a matugen run.
+**Rollback.** `switch` rolls back automatically if a step fails after the snapshot is taken: started components are stopped and stopped components are restarted (best-effort), each `config_link` is restored (preferring the `.bak-<ts>` backup made by the swap, falling back to the pending snapshot), and — if Hyprland had already been reloaded — the restored config is reloaded back into the running compositor. The pending snapshot is discarded and `state.json` marks the rice `rolled_back`. `rice-switcher rollback [ts]` restores a committed snapshot manually, re-syncs `current_rice` to the rice recorded in the snapshot, and reloads Hyprland when the restored paths include the compositor config. Rollback restores **files, symlinks and (best-effort) processes**; it cannot undo `[hooks]`, `theme.apply` or a matugen run.
 
 **Hyprland config validation.** The `validate` command runs `hyprland --verify-config --config <path>` (a non-zero result or timeout is an error; a missing `hyprland` binary is a warning). `switch` validates the manifest too (including the basic `require("...")` / `source = ...` referenced-path check on `hyprland.lua`, warnings only) and, after swapping a `hyprland` `config_link`, runs `hyprland --verify-config` again; a failure there triggers the rollback. `--verify-config` checks syntax only.
 

@@ -26,9 +26,11 @@ from .executor import (
     MATUGEN_TIMEOUT,
     ExecResult,
     default_runner,
+    default_spawner,
     run_argv,
     run_command,
     run_hook,
+    spawn_command,
 )
 from .managed_set import Identity
 from .manifest import Component, Manifest, Theme
@@ -53,6 +55,7 @@ class Runtime:
     """
 
     runner: Callable[..., ExecResult] = default_runner
+    spawner: Callable[..., ExecResult] = default_spawner
     probe: Callable[[Component], bool] | None = None
     sleeper: Callable[[float], None] = time.sleep
     clock: Callable[[], float] = time.monotonic
@@ -60,6 +63,10 @@ class Runtime:
 
     def run(self, command: str, *, timeout: float = DEFAULT_TIMEOUT) -> ExecResult:
         return run_command(command, timeout=timeout, runner=self.runner)
+
+    def spawn(self, command: str, *, timeout: float = DEFAULT_TIMEOUT) -> ExecResult:
+        """Start `command` detached (does not wait for it to exit)."""
+        return spawn_command(command, timeout=timeout, spawner=self.spawner)
 
     def argv(self, argv: Sequence[str], *, timeout: float = DEFAULT_TIMEOUT) -> ExecResult:
         return run_argv(list(argv), timeout=timeout, runner=self.runner)
@@ -139,7 +146,10 @@ def start_component(
         if audit:
             audit("skip-optional", c.name, c.start, None)
         return
-    res = rt.run(c.start, timeout=float(c.timeout))
+    # `start` launches a long-running daemon, so it must be spawned
+    # detached: waiting on it (as `run` would) blocks until timeout and
+    # kills the component. Liveness is confirmed by the poll below.
+    res = rt.spawn(c.start, timeout=float(c.timeout))
     if audit:
         audit("start", c.name, c.start, res)
     if not res.ok and c.start.strip() not in ("", "true"):

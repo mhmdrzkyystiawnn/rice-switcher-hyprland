@@ -278,7 +278,7 @@ class OldSnapshotRollbackTest(unittest.TestCase):
         with open(os.path.join(self.live, "h.txt"), "w") as f:
             f.write("MUTATED\n")
         # 4. Rollback
-        rb_ts, errs = do_rollback(self.roots, ts, None)
+        rb_ts, errs = do_rollback(self.roots, ts, None, reload_fn=lambda: None)
         self.assertEqual(rb_ts, ts, f"rollback returned {rb_ts!r}, expected {ts!r}")
         self.assertTrue(any("rice=" in e for e in errs),
             f"old-snapshot rollback must mention missing rice=; got: {errs}")
@@ -319,7 +319,7 @@ class OldSnapshotRollbackTest(unittest.TestCase):
         self.assertNotIn("rice=", captured,
             "test setup: old snapshot must not contain rice=")
         # 5. Rollback
-        ts_rb, errs = do_rollback(self.roots, ts, None)
+        ts_rb, errs = do_rollback(self.roots, ts, None, reload_fn=lambda: None)
         # Document the behavior: file IS restored, state is NOT touched.
         # This is partial state of "OK to restore file but state
         # cannot be auto-set". This is by design of the audit fix:
@@ -332,6 +332,39 @@ class OldSnapshotRollbackTest(unittest.TestCase):
         st = read_state(self.roots)
         self.assertNotEqual(st.current_rice, "a",
             f"old snapshot incorrectly updated state.current_rice to {st.current_rice!r}")
+
+
+class RollbackReloadTest(unittest.TestCase):
+    """Rolling back must reload the compositor when its config was
+    restored, otherwise the running session keeps the target's config."""
+
+    def setUp(self):
+        self.roots, self._td = _make_roots("rice-finalv-reload-")
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def test_reloads_when_compositor_config_restored(self):
+        live = os.path.join(self.roots.config_home, "hypr")
+        os.makedirs(live)
+        with open(os.path.join(live, "h.txt"), "w") as f:
+            f.write("original\n")
+        ts, _ = create_pending(self.roots, [live], rice_name="a")
+        commit_snapshot(self.roots, ts)
+        calls: list[int] = []
+        do_rollback(self.roots, ts, None, reload_fn=lambda: calls.append(1))
+        self.assertEqual(len(calls), 1, "rollback must reload the compositor")
+
+    def test_does_not_reload_for_non_compositor_config(self):
+        live = os.path.join(self.roots.config_home, "waybar")
+        os.makedirs(live)
+        with open(os.path.join(live, "c"), "w") as f:
+            f.write("x")
+        ts, _ = create_pending(self.roots, [live], rice_name="a")
+        commit_snapshot(self.roots, ts)
+        calls: list[int] = []
+        do_rollback(self.roots, ts, None, reload_fn=lambda: calls.append(1))
+        self.assertEqual(calls, [], "no compositor path restored -> no reload")
 
 
 # ---------------------------------------------------------------------------
