@@ -31,6 +31,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import signal
 import stat as stat_mod
 import subprocess
 import time
@@ -57,6 +58,8 @@ _SCP_RE = re.compile(r"^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+:.+$")
 _SANITISE_RE = re.compile(r"[^A-Za-z0-9._-]")
 # `scheme://user:pass@host` -> `scheme://host` (used to scrub git stderr).
 _CRED_RE = re.compile(r"(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*://)[^/@\s]*@")
+# A whole URL token inside free-form text (git error messages).
+_URL_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s'\"<>()\[\]{}]+")
 
 
 # A clone runner receives (argv, env, timeout) and returns an ExecResult.
@@ -73,29 +76,77 @@ def _decode(value) -> str:
     return value
 
 
+def _kill_process_group(proc: "subprocess.Popen", *, grace: float = 5.0) -> None:
+    """SIGTERM then SIGKILL an entire process group, then reap it.
+
+    `proc` must have been started with `start_new_session=True`, so its
+    PID is also its process-group ID. Killing the group is what stops
+    git's helper children (index-pack, upload-pack, ssh) from surviving a
+    timeout as orphans.
+    """
+    try:
+        pgid = os.getpgid(proc.pid)
+    except OSError:
+        pgid = None
+    if pgid and pgid > 1:
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=grace)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    if pgid and pgid > 1:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=grace)
+    except Exception:
+        pass
+
+
 def default_git_runner(
     argv: Sequence[str],
     env: Mapping[str, str],
     timeout: float = DEFAULT_CLONE_TIMEOUT,
 ) -> ExecResult:
-    """Run `argv` with `subprocess.run` and an explicit environment."""
+    """Run `argv` with an explicit environment, in its own process group.
+
+    git is started with `start_new_session=True` so that a timeout can be
+    enforced by signalling the whole group: `git clone` spawns helper
+    processes (`index-pack`, `ssh`, `upload-pack`) that a plain
+    `proc.kill()` would leave running.
+    """
     argv = list(argv)
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             argv,
-            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout,
-            check=False,
             env=dict(env),
+            start_new_session=True,
         )
-        return ExecResult(tuple(argv), proc.returncode, proc.stdout or "", proc.stderr or "")
-    except subprocess.TimeoutExpired as e:
-        return ExecResult(tuple(argv), -1, _decode(e.stdout), _decode(e.stderr), timed_out=True)
     except FileNotFoundError as e:
         return ExecResult(tuple(argv), 127, "", str(e))
     except OSError as e:
         return ExecResult(tuple(argv), 126, "", str(e))
+
+    try:
+        out, err = proc.communicate(timeout=timeout)
+        return ExecResult(tuple(argv), proc.returncode, out or "", err or "")
+    except subprocess.TimeoutExpired:
+        _kill_process_group(proc)
+        try:
+            out, err = proc.communicate(timeout=5.0)
+        except Exception:
+            out, err = "", ""
+        return ExecResult(tuple(argv), -1, _decode(out), _decode(err), timed_out=True)
 
 
 # ---------------------------------------------------------------------------
@@ -264,10 +315,17 @@ def redact_url(url: str) -> str:
 
 
 def _scrub_stderr(text: str) -> str:
-    """Collapse whitespace and strip `scheme://user:pass@` from git output."""
+    """Collapse whitespace and strip credentials from git output.
+
+    Every URL-shaped token is re-emitted through `redact_url`, which
+    removes `user:pass@`/`token@` userinfo and drops the query/fragment
+    (both can carry secrets). A final `_CRED_RE` pass is a belt-and-braces
+    catch for userinfo the URL tokeniser might have split on.
+    """
     if not text:
         return ""
     text = " ".join(text.split())
+    text = _URL_TOKEN_RE.sub(lambda m: redact_url(m.group(0)), text)
     text = _CRED_RE.sub(r"\g<scheme>", text)
     if len(text) > 500:
         text = text[:500] + "…"
@@ -339,6 +397,57 @@ def _safe_remove(path: str) -> None:
             os.unlink(path)
         except OSError:
             pass
+
+
+def _pid_alive(pid: int) -> bool:
+    """True if a process with this PID exists (any uid).
+
+    A `PermissionError` means the PID exists but belongs to someone else;
+    we treat that as alive so we never delete a temp a live process owns.
+    """
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _cleanup_stale_temps(
+    rice_home: str,
+    name: str,
+    *,
+    alive: Callable[[int], bool] | None = None,
+    keep_pid: int | None = None,
+) -> None:
+    """Remove `.<name>.tmp-<pid>` dirs whose PID is gone.
+
+    A temp whose PID is still alive (a concurrent clone) is left alone;
+    the caller's own PID is always eligible for removal. Non-numeric
+    suffixes and other rices' temps are untouched. `alive`/`keep_pid`
+    exist for tests.
+    """
+    is_alive = alive or _pid_alive
+    own = os.getpid() if keep_pid is None else keep_pid
+    prefix = f".{name}.tmp-"
+    try:
+        entries = os.listdir(rice_home)
+    except OSError:
+        return
+    for entry in entries:
+        if not entry.startswith(prefix):
+            continue
+        suffix = entry[len(prefix):]
+        if not suffix.isdigit():
+            continue
+        pid = int(suffix)
+        if pid == own or not is_alive(pid):
+            _safe_remove(os.path.join(rice_home, entry))
 
 
 # ---------------------------------------------------------------------------
@@ -471,7 +580,9 @@ def do_clone(
         )
 
     tmp = os.path.join(roots.rice_home, f".{name}.tmp-{os.getpid()}")
-    _safe_remove(tmp)  # drop any stale temp left by a previous crash
+    # Drop our own stale temp and any temp whose owning PID has died, but
+    # never a temp a still-running clone owns.
+    _cleanup_stale_temps(roots.rice_home, name)
 
     argv = ["git", "clone"]
     if depth is not None:

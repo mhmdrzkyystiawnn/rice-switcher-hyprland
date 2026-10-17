@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import os
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -23,6 +25,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from rice_switcher.clone import (
+    default_git_runner,
     derive_name,
     do_clone,
     redact_url,
@@ -219,6 +222,10 @@ class RiceNameLeadingDotTest(unittest.TestCase):
 class RedactUrlTest(unittest.TestCase):
     def test_http_userinfo_stripped(self):
         self.assertEqual(redact_url("https://user:token@host/r.git"),
+                         "https://host/r.git")
+
+    def test_userinfo_without_colon_stripped(self):
+        self.assertEqual(redact_url("https://TOKEN@host/r.git"),
                          "https://host/r.git")
 
     def test_ssh_userinfo_stripped(self):
@@ -443,6 +450,204 @@ class DoCloneIntegrationTest(unittest.TestCase):
                        depth=None, branch=None)
         self.assertTrue(res.ok, res.error)
         self.assertTrue(any("escape" in w for w in res.warnings), res.warnings)
+
+
+# ---------------------------------------------------------------------------
+# Langkah 0a: process-group timeout
+# ---------------------------------------------------------------------------
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+class DefaultGitRunnerTest(unittest.TestCase):
+    def test_normal_run_returns_rc(self):
+        res = default_git_runner(
+            [sys.executable, "-c", "import sys; sys.exit(3)"],
+            dict(os.environ), 10.0)
+        self.assertEqual(res.rc, 3)
+        self.assertFalse(res.timed_out)
+
+    def test_missing_binary_reports_127(self):
+        res = default_git_runner(["definitely-not-a-binary-xyz"],
+                                 dict(os.environ), 5.0)
+        self.assertEqual(res.rc, 127)
+
+
+class CloneTimeoutGroupTest(unittest.TestCase):
+    """A clone that hangs must not leave orphaned children behind."""
+
+    def setUp(self):
+        self.base = tempfile.mkdtemp(prefix="rs-timeout-")
+
+    def tearDown(self):
+        shutil.rmtree(self.base, ignore_errors=True)
+
+    def test_timeout_kills_whole_process_group(self):
+        pidfile = os.path.join(self.base, "child.pid")
+        script = (
+            "import subprocess, sys, time\n"
+            "p = subprocess.Popen(['sleep', '300'])\n"
+            "open(sys.argv[1], 'w').write(str(p.pid))\n"
+            "time.sleep(300)\n"
+        )
+        res = default_git_runner(
+            [sys.executable, "-c", script, pidfile], dict(os.environ), 1.0)
+        self.assertTrue(res.timed_out, res)
+
+        child = None
+        try:
+            for _ in range(100):
+                if os.path.isfile(pidfile):
+                    with open(pidfile) as f:
+                        child = int(f.read().strip())
+                    break
+                time.sleep(0.05)
+            self.assertIsNotNone(child, "helper never recorded its child")
+            gone = False
+            for _ in range(100):
+                if not _pid_alive(child):
+                    gone = True
+                    break
+                time.sleep(0.05)
+            self.assertTrue(gone, f"grandchild {child} survived the group kill")
+        finally:
+            if child and _pid_alive(child):
+                try:
+                    os.kill(child, signal.SIGKILL)
+                except OSError:
+                    pass
+
+
+# ---------------------------------------------------------------------------
+# Langkah 0b: token scrubbing in stderr, audit, provenance
+# ---------------------------------------------------------------------------
+
+class TokenScrubbingTest(unittest.TestCase):
+    def setUp(self):
+        self.base = tempfile.mkdtemp(prefix="rs-scrub-")
+        self.roots = _roots(self.base)
+
+    def tearDown(self):
+        shutil.rmtree(self.base, ignore_errors=True)
+
+    def _fail(self, url, stderr):
+        fake = FakeGit(clone_rc=128, stderr=stderr)
+        res = do_clone(url, "bar", self.roots, runner=fake,
+                       depth=None, branch=None)
+        self.assertFalse(res.ok)
+        return res
+
+    def _audit_text(self):
+        path = os.path.join(self.roots.state_home, "rice-switcher",
+                            "logs", "audit.log")
+        if not os.path.isfile(path):
+            return ""
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+
+    def test_stderr_userinfo_without_colon_scrubbed(self):
+        res = self._fail("https://TOKEN@host/r.git",
+                         "fatal: could not fetch 'https://TOKEN@host/r.git'")
+        self.assertNotIn("TOKEN", res.error)
+        self.assertNotIn("TOKEN", self._audit_text())
+
+    def test_stderr_userinfo_with_colon_scrubbed(self):
+        res = self._fail("https://user:s3cr3t@host/r.git",
+                         "fatal: 'https://user:s3cr3t@host/r.git'")
+        self.assertNotIn("s3cr3t", res.error)
+        self.assertNotIn("user:", res.error)
+        self.assertNotIn("s3cr3t", self._audit_text())
+
+    def test_stderr_query_token_scrubbed(self):
+        res = self._fail("https://host/r.git?access_token=QUERYSECRET",
+                         "fatal: 'https://host/r.git?access_token=QUERYSECRET'")
+        self.assertNotIn("QUERYSECRET", res.error)
+        self.assertNotIn("QUERYSECRET", self._audit_text())
+
+    def test_stderr_fragment_token_scrubbed(self):
+        res = self._fail("https://host/r.git#FRAGSECRET",
+                         "fatal: 'https://host/r.git#FRAGSECRET'")
+        self.assertNotIn("FRAGSECRET", res.error)
+
+    def test_provenance_userinfo_without_colon_redacted(self):
+        fake = FakeGit(rev="abc")
+        res = do_clone("https://TOKEN@host/r.git", "bar", self.roots,
+                       runner=fake, depth=None, branch=None, now="2026-01-01T00:00:00")
+        self.assertTrue(res.ok, res.error)
+        with open(os.path.join(self.roots.rice_home, "bar", ".rice-source.toml"),
+                  encoding="utf-8") as f:
+            prov = f.read()
+        self.assertNotIn("TOKEN", prov)
+        self.assertIn('source_url = "https://host/r.git"', prov)
+
+    def test_provenance_query_token_redacted(self):
+        fake = FakeGit(rev="abc")
+        res = do_clone("https://host/r.git?token=QTOK", "bar", self.roots,
+                       runner=fake, depth=None, branch=None, now="2026-01-01T00:00:00")
+        self.assertTrue(res.ok, res.error)
+        with open(os.path.join(self.roots.rice_home, "bar", ".rice-source.toml"),
+                  encoding="utf-8") as f:
+            prov = f.read()
+        self.assertNotIn("QTOK", prov)
+        self.assertIn('source_url = "https://host/r.git"', prov)
+
+
+# ---------------------------------------------------------------------------
+# Langkah 0c: stale-temp safety
+# ---------------------------------------------------------------------------
+
+class StaleTempTest(unittest.TestCase):
+    def setUp(self):
+        self.base = tempfile.mkdtemp(prefix="rs-stale-")
+        self.roots = _roots(self.base)
+
+    def tearDown(self):
+        shutil.rmtree(self.base, ignore_errors=True)
+
+    def test_live_pid_kept_dead_pid_removed(self):
+        from rice_switcher import clone as clone_mod
+        live = os.path.join(self.roots.rice_home, ".bar.tmp-11111")
+        dead = os.path.join(self.roots.rice_home, ".bar.tmp-22222")
+        weird = os.path.join(self.roots.rice_home, ".bar.tmp-notapid")
+        other = os.path.join(self.roots.rice_home, ".baz.tmp-33333")
+        for d in (live, dead, weird, other):
+            os.makedirs(d)
+        clone_mod._cleanup_stale_temps(self.roots.rice_home, "bar",
+                                       alive=lambda pid: pid == 11111)
+        self.assertTrue(os.path.isdir(live), "live-PID temp must be kept")
+        self.assertFalse(os.path.exists(dead), "dead-PID temp must be removed")
+        self.assertTrue(os.path.isdir(weird), "non-numeric temp must be kept")
+        self.assertTrue(os.path.isdir(other), "other rice's temp must be kept")
+
+    def test_own_pid_temp_removed(self):
+        from rice_switcher import clone as clone_mod
+        own = os.path.join(self.roots.rice_home, f".bar.tmp-{os.getpid()}")
+        os.makedirs(own)
+        clone_mod._cleanup_stale_temps(self.roots.rice_home, "bar",
+                                       alive=lambda pid: True)
+        self.assertFalse(os.path.exists(own))
+
+    def test_do_clone_removes_dead_temp(self):
+        # A temp whose PID is no longer alive is swept up by do_clone.
+        p = subprocess.Popen([sys.executable, "-c", "pass"])
+        p.wait()
+        dead_pid = p.pid
+        dead = os.path.join(self.roots.rice_home, f".bar.tmp-{dead_pid}")
+        os.makedirs(dead)
+        fake = FakeGit()
+        res = do_clone("https://host/r.git", "bar", self.roots, runner=fake,
+                       depth=None, branch=None)
+        self.assertTrue(res.ok, res.error)
+        self.assertFalse(os.path.exists(dead))
 
 
 if __name__ == "__main__":
