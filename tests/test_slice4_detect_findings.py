@@ -13,6 +13,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 THIS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = THIS_DIR.parent
@@ -136,6 +137,32 @@ class NeedsMaterializationFindingTest(unittest.TestCase):
         })
         d = detect(rice, roots=_roots(self.tmp))
         self.assertEqual(_findings(d, NEEDS_MATERIALIZATION), [])
+
+    def test_apply_script_is_never_executed(self):
+        # The materialisation finding is *reported*, never acted on: the
+        # detector must not run the rice's `apply` script (or any process).
+        rice = _mkrice(self.tmp, "r", {
+            "profiles/ii.conf": "exec = waybar\n",
+            "hypr-profile.sh": (
+                "case \"$1\" in\n"
+                "apply) touch " + os.path.join(self.tmp, "PWNED") + ";;\n"
+                "esac\n"
+            ),
+        })
+        marker = os.path.join(self.tmp, "PWNED")
+        with mock.patch("subprocess.run", side_effect=AssertionError("run")), \
+             mock.patch("subprocess.Popen", side_effect=AssertionError("Popen")), \
+             mock.patch("subprocess.check_output",
+                        side_effect=AssertionError("check_output")), \
+             mock.patch("os.system", side_effect=AssertionError("system")), \
+             mock.patch("os.popen", side_effect=AssertionError("popen")), \
+             mock.patch("os.execv", side_effect=AssertionError("execv")), \
+             mock.patch("os.spawnv", side_effect=AssertionError("spawnv")):
+            d = detect(rice, roots=_roots(self.tmp))
+        # the finding fired (so the scan really saw the script) ...
+        self.assertEqual(len(_findings(d, NEEDS_MATERIALIZATION)), 1)
+        # ... yet nothing was executed.
+        self.assertFalse(os.path.exists(marker))
 
 
 if __name__ == "__main__":
