@@ -35,6 +35,7 @@ from rice_switcher.detect import (
     detect,
     plan_layout_normalization,
 )
+from rice_switcher.gaps import AUTOSTART_CONFLICT
 from rice_switcher.paths import Roots
 
 
@@ -206,11 +207,15 @@ class AutostartTest(unittest.TestCase):
         self.assertTrue(h.exact_argv.value)
         self.assertEqual(h.stop.value, "")
 
-    def test_autostart_conflict_noted(self):
+    def test_autostart_conflict_note_replaced_by_structured_finding(self):
+        # Fase 4: the old free-text note is gone; a structured finding now
+        # carries the component, refs and handling options (DESIGN §6.1).
         rice = _mkrice(self.tmp, "r", {"hypr/hyprland.conf": "exec-once = waybar\n"})
         d = detect(rice, roots=_roots(self.tmp))
-        joined = " ".join(d.notes)
-        self.assertIn("autostart", joined.lower())
+        self.assertFalse(any("autostart bentrok" in n for n in d.notes))
+        fs = [f for f in d.findings if f.kind == AUTOSTART_CONFLICT]
+        self.assertEqual(len(fs), 1)
+        self.assertEqual(fs[0].component, "waybar")
 
     def test_autostart_refs_record_file_line_kind_raw(self):
         rice = _mkrice(self.tmp, "r", {

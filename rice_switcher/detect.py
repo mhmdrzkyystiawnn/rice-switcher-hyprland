@@ -873,10 +873,14 @@ def detect(rice_dir: str, *, roots: "Roots | None" = None) -> ManifestDraft:
     draft.autostart_refs = refs
 
     comps: dict[str, DraftComponent] = {}
-    autostart_names: set[str] = set()
+    # Fase 4: remember which autostart refs produced which component so the
+    # gap classifiers can report an `autostart_conflict` per managed name.
+    # `_components_from_autostart` returns [] for unreachable refs, so only
+    # reachable lines ever appear here.
+    autostart_refs_by_name: dict[str, list[AutostartRef]] = {}
     for ref in refs:
         for dc in _components_from_autostart(ref, var_map):
-            autostart_names.add(dc.name)
+            autostart_refs_by_name.setdefault(dc.name, []).append(ref)
             _add(comps, dc)
 
     _add_dir_signals(comps, cfg, draft)
@@ -884,7 +888,7 @@ def detect(rice_dir: str, *, roots: "Roots | None" = None) -> ManifestDraft:
     if not entrypoints:
         draft.notes.append(
             "tidak ada entrypoint Hyprland (hyprland.lua/.conf) yang bisa dibaca; "
-            "autostart tidak dipindai (rice mungkin butuh materialisasi — Fase 4)")
+            "autostart tidak dipindai")
     else:
         unreachable_refs = [r for r in refs if not r.reachable and r.file]
         if unreachable_refs:
@@ -896,12 +900,14 @@ def detect(rice_dir: str, *, roots: "Roots | None" = None) -> ManifestDraft:
                 "autostart di berkas tak terjangkau diabaikan (arsip/profil "
                 "tidak aktif): " + ", ".join(files_seen[:8]))
 
-    for name in sorted(autostart_names):
-        dc = comps[name]
-        draft.notes.append(
-            f"autostart bentrok: {name} juga dijalankan oleh config rice "
-            f"({dc.source}); default Opsi B — biarkan config yang menjalankan, "
-            f"switcher hanya stop")
+    # Fase 4 (sempit): structured, read-only gap findings (DESIGN §6).
+    # Imported lazily: `gaps` reads helpers from this module.
+    from .gaps import collect_findings
+    draft.findings = collect_findings(
+        rice_dir,
+        has_entrypoint=bool(entrypoints),
+        autostart_refs_by_name=autostart_refs_by_name,
+    )
 
     if not comps:
         draft.notes.append(
