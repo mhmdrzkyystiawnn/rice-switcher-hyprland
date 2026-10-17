@@ -154,6 +154,20 @@ def compute_plan(
 
     managed = load_managed_set(all_manifests)
 
+    # Compositor identities across ALL manifests (PLAN.md §2c Aturan 1):
+    # an identity is protected as the compositor if ANY rice declares it so,
+    # regardless of which rice is current or target. Resolving the type from
+    # `current_manifest` alone left a hole: a compositor that is active but
+    # not declared as compositor in the current manifest (or declared with a
+    # different `type`) could land in `to_stop`, where `find_component` then
+    # resolves it to the real compositor component and stops it.
+    compositor_identities = {
+        Identity.from_component(c)
+        for m in all_manifests
+        for c in m.components
+        if c.type == "compositor"
+    }
+
     target_identities = {Identity.from_component(c) for c in target_manifest.components}
 
     # Derive "currently active identities" from the current manifest if
@@ -168,21 +182,12 @@ def compute_plan(
 
     # 1. to_stop: identities currently active and NOT in target, and
     #    not compositor. Compositor is exempt (§2c Aturan 1).
-    def _type_of(ident: Identity, m: Manifest | None) -> str | None:
-        if m is None:
-            return None
-        for c in m.components:
-            if Identity.from_component(c) == ident:
-                return c.type
-        return None
-
     for ident in sorted(active_identities, key=str):
         if ident in target_identities:
             continue
         if ident.executable in SHARED_COMPONENT_NAMES:
             continue
-        ctype = _type_of(ident, current_manifest)
-        if ctype == "compositor":
+        if ident in compositor_identities:
             continue
         plan.to_stop.append(ident)
 
@@ -193,8 +198,7 @@ def compute_plan(
             continue
         if ident.executable in SHARED_COMPONENT_NAMES:
             continue
-        if any(c.type == "compositor" and Identity.from_component(c) == ident
-               for c in target_manifest.components):
+        if ident in compositor_identities:
             continue
         plan.to_start.append(ident)
 

@@ -85,6 +85,16 @@ def _gather_config_links(manifest: Manifest) -> list[str]:
     ]
 
 
+def stop_targets(plan: SwitchPlan) -> list[str]:
+    """Human-readable list of the processes the plan will stop.
+
+    PLAN.md §2h requires the confirmation view to show what will be
+    stopped. Kill-by-identity has no command string, so we render the
+    identity (`executable argv_match`) instead of a shell command.
+    """
+    return [str(ident) for ident in plan.to_stop]
+
+
 def _print_plan(plan: SwitchPlan, roots: Roots) -> str:
     lines: list[str] = []
     lines.append(f"Switch plan: {plan.current or '<none>'} -> {plan.target}")

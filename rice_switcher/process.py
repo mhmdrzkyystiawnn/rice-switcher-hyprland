@@ -4,20 +4,21 @@ PLAN.md §2g. We do NOT use `pkill -f` (too broad). Instead, we scan
 `/proc/<pid>/cmdline` for an exact match of the executable basename plus
 a subset match on `argv_match` tokens.
 
-This module is read-only: it never sends a signal. The actual `kill` is
-performed by `cli.py` (Slice 1 dry-run path) or a future real-execution
-path; the slice 1 implementation only enumerates identities and reports
-them.
-
-Note for the executor: `kill` is performed by the caller; this module
-returns the list of PIDs. The caller decides whether to actually send a
-signal (Slice 1: never).
+Enumeration (`find_pids_by_identity`, `probe_pids_by_identity`) is
+read-only. The signalling path lives in `terminate_by_identity`
+(Prasyarat 0 / DESIGN-onboarding-tui.md §4.2): because the identity can
+come from someone else's `rice.toml`, it only signals processes we own,
+re-reads `/proc/<pid>/cmdline` right before each signal, and refuses a
+basename-only match.
 """
 
 from __future__ import annotations
 
 import os
 import re
+import signal
+import time
+from typing import Callable
 
 
 def _is_pid_dir(name: str) -> bool:
@@ -106,6 +107,138 @@ def find_pids_by_identity(
             continue
         out.append(pid)
     return out
+
+
+def is_own_uid(pid: int, *, uid: int | None = None) -> bool:
+    """True if `/proc/<pid>` is owned by `uid` (default: our own uid).
+
+    We only ever signal processes we own. Any error (missing PID, no
+    permission) returns False.
+    """
+    if uid is None:
+        uid = os.getuid()
+    try:
+        st = os.stat(f"/proc/{pid}")
+    except OSError:
+        return False
+    return st.st_uid == uid
+
+
+def pid_matches_identity(
+    pid: int,
+    executable: str,
+    argv_match: tuple[str, ...] | list[str] = (),
+) -> bool:
+    """Re-read `/proc/<pid>/cmdline` and confirm it still matches.
+
+    Used immediately before signalling to defeat PID reuse: between the
+    scan and the kill, the PID may have been recycled by an unrelated
+    process. A missing, unreadable or empty (zombie) cmdline returns
+    False, as does a different basename or missing argv token.
+    """
+    argv = read_cmdline(pid)
+    if not argv:
+        return False
+    ident = identity_from_argv(argv)
+    if ident is None:
+        return False
+    exe, tokens = ident
+    if exe != executable:
+        return False
+    return all(tok in tokens for tok in tuple(argv_match))
+
+
+def terminate_by_identity(
+    executable: str,
+    argv_match: tuple[str, ...] | list[str],
+    *,
+    timeout: float = 10.0,
+    sigterm: int = signal.SIGTERM,
+    sigkill: int = signal.SIGKILL,
+    find: Callable[..., list[int]] | None = None,
+    matches: Callable[[int, str, tuple[str, ...] | list[str]], bool] | None = None,
+    owned: Callable[[int], bool] | None = None,
+    kill: Callable[[int, int], None] | None = None,
+    sleeper: Callable[[float], None] | None = None,
+    clock: Callable[[], float] | None = None,
+    poll_interval: float = 0.2,
+) -> list[int]:
+    """Stop every process matching `(executable, argv_match)` that we own.
+
+    Guards (DESIGN-onboarding-tui.md §4.2):
+
+    * own uid only; never PID 1, this process, or its parent;
+    * `argv_match` is **required** — a basename-only match is too broad
+      (`qs -c ii` and `qs -c minimal` share the basename `qs`);
+    * `/proc/<pid>/cmdline` is re-read right before each signal (PID
+      reuse guard);
+    * SIGTERM, wait up to `timeout`, then SIGKILL the survivors.
+
+    All side effects go through the injected
+    `find`/`matches`/`owned`/`kill`/`sleeper`/`clock` seams, so tests can
+    drive it deterministically without touching a real process. Returns
+    the PIDs that were sent SIGTERM.
+    """
+    if find is None:
+        find = find_pids_by_identity
+    if matches is None:
+        matches = pid_matches_identity
+    if owned is None:
+        owned = is_own_uid
+    if kill is None:
+        kill = os.kill
+    if sleeper is None:
+        sleeper = time.sleep
+    if clock is None:
+        clock = time.monotonic
+
+    argv_match = tuple(argv_match)
+    if not argv_match:
+        raise ValueError(
+            "refusing to kill by basename alone: argv_match is required "
+            f"(executable={executable!r})"
+        )
+
+    forbidden = {1}
+    try:
+        forbidden.add(os.getpid())
+        forbidden.add(os.getppid())
+    except OSError:
+        pass
+
+    signaled: list[int] = []
+    for pid in find(executable, argv_match):
+        if pid in forbidden:
+            continue
+        if not owned(pid):
+            continue
+        if not matches(pid, executable, argv_match):
+            continue  # PID reuse / already gone
+        try:
+            kill(pid, sigterm)
+        except ProcessLookupError:
+            continue
+        signaled.append(pid)
+
+    if not signaled:
+        return []
+
+    start = clock()
+    while True:
+        alive = [p for p in signaled if matches(p, executable, argv_match)]
+        if not alive:
+            break
+        if clock() - start >= timeout:
+            for pid in alive:
+                if not matches(pid, executable, argv_match):
+                    continue  # ended in the meantime
+                try:
+                    kill(pid, sigkill)
+                except ProcessLookupError:
+                    pass
+            break
+        sleeper(poll_interval)
+    return signaled
 
 
 # Reject pkill-style patterns in user-supplied start/stop fields.

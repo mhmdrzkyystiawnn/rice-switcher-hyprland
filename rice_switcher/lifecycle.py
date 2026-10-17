@@ -34,7 +34,7 @@ from .executor import (
 )
 from .managed_set import Identity
 from .manifest import Component, Manifest, Theme
-from .process import probe_pids_by_identity
+from .process import probe_pids_by_identity, terminate_by_identity
 
 
 class LifecycleError(RuntimeError):
@@ -82,6 +82,20 @@ class Runtime:
         res = probe_pids_by_identity(c.executable or c.name, c.argv_match)
         return res.status == "running"
 
+    def kill_processes(self, c: Component) -> list[int]:
+        """Stop `c` by process identity (Prasyarat 0).
+
+        Used when a component declares no `stop` command: find its
+        processes by `(executable, argv_match)`, re-check ownership and
+        identity, then SIGTERM -> wait -> SIGKILL. See
+        `process.terminate_by_identity` for the guards.
+        """
+        return terminate_by_identity(
+            c.executable or c.name,
+            tuple(c.argv_match),
+            timeout=float(c.timeout),
+        )
+
     def wait_for(self, predicate: Callable[[], bool], timeout: float) -> bool:
         start = self.clock()
         while True:
@@ -117,16 +131,42 @@ def _binary_present(start: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def stop_component(rt: Runtime, c: Component, *, audit: AuditFn | None = None) -> None:
-    cmd = c.stop or "true"
-    res = rt.run(cmd, timeout=float(c.timeout))
-    if audit:
-        audit("stop", c.name, cmd, res)
-    if not res.ok and cmd.strip() not in ("", "true"):
-        if c.optional:
-            return
+    if c.type == "compositor" and not c.stop:
+        # Defence in depth (PLAN.md §2c Aturan 1): the compositor is never
+        # part of the managed set. Even with an empty `stop`, refuse to
+        # kill it by identity rather than signalling Hyprland.
         raise LifecycleError(
-            f"stop failed for {c.name!r}: rc={res.rc} {res.stderr.strip()} (cmd={cmd!r})"
+            f"refusing to stop compositor {c.name!r} by identity: the "
+            f"compositor is never stopped or started by the switcher; give "
+            f"it an explicit `stop` if this is truly intended"
         )
+    if c.stop:
+        cmd = c.stop
+        res = rt.run(cmd, timeout=float(c.timeout))
+        if audit:
+            audit("stop", c.name, cmd, res)
+        if not res.ok and cmd.strip() not in ("", "true"):
+            if c.optional:
+                return
+            raise LifecycleError(
+                f"stop failed for {c.name!r}: rc={res.rc} {res.stderr.strip()} (cmd={cmd!r})"
+            )
+    else:
+        # Prasyarat 0 (DESIGN-onboarding-tui.md §4.2): no `stop` command
+        # declared -> stop by process identity. `argv_match` is
+        # mandatory here: a basename-only kill would also hit an
+        # unrelated instance (e.g. `qs -c minimal`).
+        if not c.argv_match:
+            if c.optional:
+                return
+            raise LifecycleError(
+                f"component {c.name!r}: cannot stop by identity without "
+                f"argv_match (refusing a basename-only kill)"
+            )
+        rt.kill_processes(c)
+        if audit:
+            label = f"{c.executable or c.name} {' '.join(c.argv_match)}".strip()
+            audit("stop.identity", c.name, label, None)
     if not rt.wait_for(lambda: not rt.is_running(c), float(c.timeout)):
         if c.optional:
             return

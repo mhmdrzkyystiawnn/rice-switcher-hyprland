@@ -242,6 +242,19 @@ def _extract_hyprland_refs(rice_root: str, config_link: str) -> tuple[list[str],
     return refs, warnings
 
 
+# Prasyarat 0 (DESIGN-onboarding-tui.md §4.2): a manifest must not be
+# able to make the switcher stop/kill a session-critical process. The
+# compositor component is exempt: it legitimately names `hyprland` and is
+# never stopped by the managed set (§2c Aturan 1).
+_SESSION_EXECUTABLES = frozenset({
+    "hyprland",
+    "systemd", "systemd-logind", "systemd-user", "init",
+    "dbus-daemon", "dbus-broker", "dbus-launch",
+    "gnome-keyring-daemon", "gnome-keyring",
+    "kwin_wayland", "kwin_x11", "gnome-shell", "plasmashell",
+})
+
+
 # ---------------------------------------------------------------------------
 # Top-level entry
 # ---------------------------------------------------------------------------
@@ -297,6 +310,16 @@ def validate_manifest(
             res.warnings.append(
                 f"component {c.name!r}: executable should be a basename, "
                 f"got {c.executable!r}"
+            )
+        # Prasyarat 0 (§4.2): refuse session-critical executables. The
+        # compositor is exempt (it names `hyprland` on purpose and is
+        # never killed); every other component must not point at a
+        # session process.
+        exe_base = os.path.basename(c.executable).lower() if c.executable else ""
+        if c.type != "compositor" and exe_base in _SESSION_EXECUTABLES:
+            res.errors.append(
+                f"component {c.name!r}: executable {c.executable!r} names a "
+                f"session-critical process; refusing to manage or kill it"
             )
         # PLAN.md §2g: `pkill -f`/`--full` matches the whole command line,
         # including the switcher's own argv. Refuse it in any lifecycle

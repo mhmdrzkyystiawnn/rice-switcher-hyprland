@@ -508,6 +508,14 @@ def cmd_switch(args, roots: Roots, log) -> int:
                 dry_run=True, force_real=False, logger=log,
             )
             print(plan_str(outcome_preview.plan, roots), file=sys.stderr)
+            # Prasyarat 0: kill-by-identity has no command string, so the
+            # user must see which processes will be signalled.
+            from .switch import stop_targets
+            targets = stop_targets(outcome_preview.plan)
+            if targets:
+                print("akan menghentikan proses:", file=sys.stderr)
+                for tgt in targets:
+                    print(f"  - {tgt}", file=sys.stderr)
             if not _confirm_prompt(
                 f"about to switch to {target_m.meta.name!r} (real execution)"
             ):
