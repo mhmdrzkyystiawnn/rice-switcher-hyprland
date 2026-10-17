@@ -124,6 +124,18 @@ class _StubRuntime(Runtime):
         return ExecResult((command,), 0, "", "")
 
 
+class _ScriptedAsk:
+    """Returns queued answers; raises EOFError when exhausted."""
+
+    def __init__(self, answers):
+        self.answers = list(answers)
+
+    def __call__(self, prompt: str) -> str:
+        if not self.answers:
+            raise EOFError
+        return self.answers.pop(0)
+
+
 class OnboardingE2ETest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="rs-e2e-")
@@ -293,6 +305,75 @@ class OnboardingE2ETest(unittest.TestCase):
         # state advanced to the cloned rice.
         from rice_switcher.state import read_state
         self.assertEqual(read_state(self.roots).current_rice, "cloned")
+
+    def test_clone_review_save_validate_dryrun(self):
+        """Fase 3a: the reviewed (line-prompt) save path end-to-end.
+
+        clone -> `generate --no-tui` with a scripted answer -> `validate`
+        -> `switch --dry-run`. Every artefact must land inside the tempdir;
+        the dry-run must not change the live links.
+        """
+        from rice_switcher.cli import build_parser, cmd_generate
+
+        src = self._make_source_repo()
+
+        rc, out, err = self.run_cli(
+            "clone", f"file://{src}", "--name", "reviewed",
+            "--allow-local", "--yes",
+        )
+        self.assertEqual(rc, 0, err)
+        cloned = os.path.join(self.rice_home, "reviewed")
+
+        # 2. review-and-save with a scripted "s".
+        args = build_parser().parse_args(["generate", "reviewed", "--no-tui"])
+        out_lines: list[str] = []
+        with mock.patch.dict(os.environ, self.env, clear=False):
+            rc = cmd_generate(args, self.roots, None,
+                              ask=_ScriptedAsk(["s"]), out=out_lines.append)
+        self.assertEqual(rc, 0, "\n".join(out_lines))
+        mp = os.path.join(cloned, "rice.toml")
+        self.assertTrue(os.path.isfile(mp))
+        data = tomllib.loads(open(mp).read())
+        self.assertEqual(data["meta"]["name"], "reviewed")
+        comps = {c["name"]: c for c in data["components"]}
+        self.assertIn("hyprland", comps)
+        self.assertIn("waybar", comps)
+        self.assertEqual(comps["waybar"]["stop"], "")
+
+        # layout normalization: the swap target resolves to .config/<x>.
+        live_before = {name: os.readlink(os.path.join(self.config_home, name))
+                       for name in ("hypr", "waybar")
+                       if os.path.islink(os.path.join(self.config_home, name))}
+        for name in ("hypr", "waybar"):
+            link = os.path.join(cloned, name)
+            self.assertTrue(os.path.islink(link), f"{link} not a symlink")
+            self.assertEqual(os.readlink(link), f".config/{name}")
+
+        # 3. validate.
+        rc, out, err = self.run_cli("validate", "reviewed")
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("0 error(s)", out + err)
+
+        # 4. dry-run switch.
+        rc, out, err = self.run_cli("switch", "reviewed", "--dry-run")
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("hypr", out)
+
+        # dry-run touched nothing: live links unchanged.
+        live_after = {name: os.readlink(os.path.join(self.config_home, name))
+                      for name in ("hypr", "waybar")
+                      if os.path.islink(os.path.join(self.config_home, name))}
+        self.assertEqual(live_before, live_after)
+
+        # every artefact is inside the tempdir.
+        tmp_real = os.path.realpath(self.tmp)
+        for p in (mp, self.config_home, os.path.join(self.config_home, "hypr"),
+                  os.path.join(self.state_home, "rice-switcher"),
+                  os.path.join(self.rice_home, "reviewed")):
+            self.assertTrue(
+                os.path.realpath(p).startswith(tmp_real),
+                f"{p} resolves outside the tempdir",
+            )
 
 
 if __name__ == "__main__":
