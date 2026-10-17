@@ -1,12 +1,13 @@
 # Design — Onboarding TUI: clone, auto-manifest, gap detection
 
-**Status:** draft **revisi #2** — Prasyarat 0 (kill-by-identity), **Fase 1 (clone + naming)**, dan **Fase 2 (detect + tomlwrite + `generate`)** sudah diimplementasikan & diuji; Fase 3–6 belum.
-**Status implementasi:** ✅ Prasyarat 0 (§12) — `process.py`/`lifecycle.py`/`managed_set.py`; ✅ Fase 1 clone + naming (§3, §9, §10) — `rice_switcher/clone.py`, subcommand `clone`, `tests/test_clone.py`; ✅ Fase 2 deteksi & draft manifest (§4) — `rice_switcher/detect.py`, `rice_switcher/tomlwrite.py`, subcommand `generate`, `tests/test_detect.py`, `tests/test_tomlwrite.py`, `tests/test_generate.py`; ⬜ Fase 3–6.
+**Status:** draft **revisi #3** — Prasyarat 0 (kill-by-identity), **Fase 1 (clone + naming)**, dan **Fase 2 (detect + tomlwrite + `generate`) + penyempurnaan 2b** (deteksi berbasis reachability, identitas tanpa argumen) sudah diimplementasikan & diuji; Fase 3–6 belum.
+**Status implementasi:** ✅ Prasyarat 0 (§12) — `process.py`/`lifecycle.py`/`managed_set.py`, identitas tanpa argumen (`exact_argv`, Fase 2b) — `tests/test_slice0_exact_identity.py`; ✅ Fase 1 clone + naming (§3, §9, §10) — `rice_switcher/clone.py`, subcommand `clone`, `tests/test_clone.py`; ✅ Fase 2 deteksi & draft manifest (§4) — `rice_switcher/detect.py`, `rice_switcher/tomlwrite.py`, subcommand `generate`, `tests/test_detect.py`, `tests/test_detect_reachability.py`, `tests/test_tomlwrite.py`, `tests/test_generate.py`; ✅ integrasi end-to-end `clone → generate → validate → switch` — `tests/test_e2e_onboarding.py`; ✅ peringatan `validate` untuk `stop` no-op — `tests/test_slice2b_stop_noop.py`; ⬜ Fase 3–6.
 **Cakupan:** alur "clone rice orang lain → bisa di-`switch`" menjadi semi-otomatis lewat TUI.
 **Dokumen terkait:** `docs/PLAN.md` (spec inti switch; §2c managed set, §2f `config_link`, §2g identitas proses, §2h keamanan, §4.1 skema manifest, §5.1 zero-dep, §6 roadmap), `README.md`.
 **Sifat:** dokumen desain. Tidak mengubah `docs/PLAN.md`; mekanisme inti switch tetap apa adanya — **kecuali** Prasyarat 0 (kill-by-identity, §12) yang menyentuh `process.py`/`lifecycle.py`.
 
 **Riwayat revisi**
+- **revisi #3** — penyempurnaan Fase 2b pasca-implementasi: (1) deteksi berbasis **reachability** dari entrypoint (§4.1), (2) pemecahan **perintah gabungan** + pelewatan wrapper, (3) tabel executable diperluas (`awww`/`swww-daemon`, `pypr`, `mpvpaper`, dst.), (4) **identitas tanpa argumen** `exact_argv` untuk daemon (§4.2), (5) peringatan `validate` untuk `stop` no-op, (6) koreksi dokumen §4.3/§4.5/§4.6 agar cocok dengan implementasi & tes.
 - **revisi #2** — menutup review keamanan & desain: (1) hardening argument injection saat clone, (2) larangan nama berawalan titik, (3) aturan containment symlink, (4) provenance di file terpisah + URL di-redact, (5) temuan baru **autostart bentrok**, (6) cleanup `.bak-*` via `lstat`+`unlink` (bukan `rmtree`), (7) tampilkan isi skrip sebelum approve. Plus **keputusan 7 pertanyaan terbuka** (§14) dan **Prasyarat 0: kill-by-identity** di core (§12). Urutan dibalik: fallback prompt dulu, `curses` terakhir (§5.1).
 - revisi #1 — draft awal.
 
@@ -162,29 +163,33 @@ Inti fitur. Menghasilkan `ManifestDraft` (bukan final). Sumber inferensi utama =
 | file variabel (`variables.lua`, `*.conf` `$var=`) | resolusi `$qsConfig` dsb. → nilai konkret | tinggi |
 | README "Dependencies"/`packages` | daftar binary untuk cek (`validate`) | sedang |
 
-Contoh nyata (elifouts): `execs.lua:6 → hl.exec_cmd("qs -c $qsConfig")` + `variables.lua:5 → hl.env("qsConfig","ii")` ⇒ komponen quickshell `qs -c ii`. Parser harus mengikuti indireksi variabel ini.
+Contoh pola (teruji di `tests/test_detect.py`): `hl.exec_cmd("qs -c $qsConfig")` + `hl.env("qsConfig","ii")` ⇒ komponen quickshell `qs -c ii`. Parser harus mengikuti indireksi variabel ini (variabel hanya diambil dari berkas yang terjangkau — lihat di bawah).
+
+**Reachability (Fase 2b).** Hanya autostart dari berkas yang benar-benar **terjangkau** dari entrypoint (`hyprland.lua`/`.conf`) yang menjadi komponen. Detector mengikuti `source =` (hyprlang) dan `require(...)`/`dofile(...)` literal (Lua) selama `realpath` tetap di dalam folder rice (containment), dengan penjaga siklus + batas kedalaman (`MAX_SOURCE_DEPTH`). Direktori `archive`/`old`/`backup`/`bak`/`examples`/`example` dan profil tak aktif tidak pernah dianggap hidup; ref-nya tetap dicatat dengan `reachable=False` (untuk Fase 4). Bila tidak ada entrypoint yang terbaca, detector **tidak** mundur ke "pindai semua" — dilaporkan sebagai catatan "tidak ada entrypoint". Perintah gabungan (`&&`, `;`, `||`, `|`, `&`) dipecah (menghormati quote) dan wrapper (`sleep N`, `env VAR=...`, `exec`, `setsid`, `nohup`, `uwsm app --`, `systemd-run --user`) dilewati sebelum mengambil executable. Tabel executable: `qs`/`quickshell`, `waybar`, `hypridle`, `dunst`, `mako`, `swaync`/`swaync-client`, `hyprpaper`, `swww`/`swww-daemon`, `awww`/`awww-daemon`, `mpvpaper`, `hyprlock`, `hyprsunset`, `hyprpolkitagent`, `pypr`, `fcitx5`. Deteksi ini memakai mekanisme identitas Fase 2b: perintah tanpa argumen ⇒ komponen dengan `exact_argv = true` (bisa dihentikan), perintah dengan argumen literal ⇒ `argv_match` (subset).
 
 **⚠ Autostart bentrok (temuan baru — wajib, lihat §6.1).** Baris autostart itu **tetap ada** di config rice. Kalau detector menjadikannya komponen terkelola, `switch` akan **start** komponen itu, sementara `exec-once`/`exec` di config juga menjalankannya → **start ganda**, atau **saling bunuh** saat reload (`exec` jalan ulang tiap `hyprctl reload`; `exec-once` hanya sekali). Karena itu detector **wajib** memunculkan temuan "autostart bentrok" dengan dua opsi penanganan (§6.1) — **default Opsi B** ("dijalankan oleh config": switcher hanya stop) — **tidak** diam-diam membuat komponen start+stop.
 
 ### 4.2 Yang butuh keputusan / perhatian user
-- **`stop` → dikosongkan (keputusan #2).** Generator **tidak mengisi `stop`** dan **tidak menebak `pkill -x`**. `stop` kosong → `stop_component` memakai stop bawaan berbasis PID (identitas `executable` + `argv_match`, `docs/PLAN.md §2g`). Ini bergantung pada **Prasyarat 0** (§12): kill-by-identity di `process.py`/`lifecycle.py`; tanpa itu `stop` kosong = jalankan `true` lalu **menunggu** → timeout (`lifecycle.py:119-136`). Kalau identitas ambigu → tandai `ask`, jangan mengarang `stop`.
+- **`stop` → dikosongkan untuk komponen terkelola (keputusan #2).** Skema manifest (`docs/PLAN.md §2.0`) punya default `stop = "true"` (no-op), tetapi generator **selalu menulis `stop = ""` secara eksplisit** untuk komponen non-compositor agar memilih jalur stop berbasis identitas, bukan no-op. Kompositor dikecualikan: `stop = "true"` (switcher tidak pernah menghentikan/menjalankan kompositor, `docs/PLAN.md §2c`). `stop` kosong → `stop_component` memakai stop bawaan berbasis PID (identitas `executable` + `argv_match`/`exact_argv`, `docs/PLAN.md §2g`). Ini bergantung pada **Prasyarat 0** (§12): kill-by-identity di `process.py`/`lifecycle.py`. Kalau identitas ambigu → tandai `ask`, jangan mengarang `stop`.
 - `argv_match` bila ambigu (variabel tak teresolusi, quoting, beberapa instance).
 - `type` bila ambigu ("shell" vs "bar").
 - `name` komponen bila bentrok.
 - **Urutan** start antar komponen.
 
+**Identitas tanpa argumen (`exact_argv`, Fase 2b).** Daemon tanpa argumen (mis. `waybar`, `hypridle`, `mako`, `dunst`, `awww-daemon`) tidak punya token `argv_match`; subset match `argv_match=[]` terlalu luas (cocok dengan `waybar -c x` juga). Karena itu manifest punya field eksplisit `exact_argv = true`: argv proses harus **sama persis** dengan `executable` + `argv_match` (jumlah, isi, urutan). `exact_argv = true` + `argv_match = []` = identitas "tanpa argumen" (argv proses tepat satu elemen). `argv_match = []` **tanpa** `exact_argv` tetap **ditolak** (kill basename-only dilarang) dengan pesan yang menyebut `exact_argv`. Generator menulis `exact_argv = true` untuk daemon tanpa argumen sehingga draf bisa langsung di-`switch` (teruji end-to-end: `tests/test_e2e_onboarding.py`). `validate` memperingatkan komponen non-compositor dengan `start` bermakna tetapi `stop` no-op (`true`/`:` atau `stop` kosong tanpa identitas) — "tidak akan pernah dihentikan; switch akan start ganda".
+
 Draft menandai tiap field dengan tingkat keyakinan (`auto` / `guess` / `ask`). TUI menonjolkan yang `guess`/`ask`.
 
 **Guard kill-by-identity (brief Prasyarat 0).** Ini kode baru yang bisa **membunuh proses**, dan `executable`/`argv_match` bisa berasal dari `rice.toml` orang lain. Wajib:
 - Hanya PID milik **uid sendiri**; abaikan **PID 1**, PID switcher sendiri, dan **parent**-nya.
-- Cocokkan **argv lengkap** (identitas `executable` + `argv_match`), **bukan** basename saja — kalau tidak, `qs -c ii` dan `qs -c minimal` dianggap sama. Tolak/lewati bila `argv_match` kosong (terlalu luas).
+- Cocokkan **argv lengkap** (identitas `executable` + `argv_match`/`exact_argv`), **bukan** basename saja — kalau tidak, `qs -c ii` dan `qs -c minimal` dianggap sama. Tolak/lewati bila `argv_match` kosong **dan** `exact_argv` tidak di-set (terlalu luas); `exact_argv = true` + `argv_match = []` sah untuk daemon tanpa argumen (argv harus tepat satu elemen).
 - **Baca ulang `/proc/<pid>/cmdline` tepat sebelum kill** (cegah PID reuse).
 - **SIGTERM → tunggu (timeout) → SIGKILL**.
 - **Lindungi proses sesi**: manifest dengan `executable` = `Hyprland`/`systemd`/`dbus-daemon`/`gnome-keyring-daemon` (dan sejenisnya) **ditolak validator** — ada tesnya.
 - **Gerbang konfirmasi menampilkan target**: saat ini konfirmasi `yes` untuk rice baru menampilkan command string, padahal kill-by-identity bukan string → tambahkan baris **"akan menghentikan proses: …"**.
 
 ### 4.3 Layout → `config_link` (keputusan #1)
-Konvensi swap: target = `<RICE_HOME>/<name>/<basename(config_link)>` (`switch.py:268-271`). Artinya config harus ada di **root rice** dengan nama `basename`-nya.
+Konvensi swap: target = `<RICE_HOME>/<name>/<basename(config_link)>` (`switch.py:279-285`). Artinya config harus ada di **root rice** dengan nama `basename`-nya.
 
 Dua bentuk repo:
 - **(a) Gaya `~/.config`**: repo punya `.config/hypr`, `.config/waybar`, … → generator memetakan `config_link="~/.config/hypr"`, tetapi **harus menormalkan layout** ke root rice.
@@ -193,6 +198,8 @@ Dua bentuk repo:
 **Keputusan:** normalisasi ke root rice dengan **symlink relatif** (`<name>/hypr -> .config/hypr`) supaya tidak menggandakan file besar. Symlink yang dibuat generator **didaftarkan di `<rice>/.git/info/exclude`** agar repo clone tetap bersih dan `git pull` tidak bentrok.
 
 **Containment wajib:** saat scan (`detect.py`) maupun saat membuat/menghapus symlink normalisasi, **jangan mengikuti** symlink yang `realpath`-nya keluar dari folder rice. Repo asing bisa berisi `hypr -> /etc` atau `waybar -> ~/.ssh`; tanpa aturan ini, isi pribadimu bisa terbaca atau ikut ter-swap. Detail: §10.
+
+**Teruji end-to-end (Fase 2b Langkah 4).** `tests/test_e2e_onboarding.py` menjalankan `clone` (repo `file://` lokal) → `generate --write` → `validate` → `switch` hermetic di tempdir (`RICE_HOME`/`RICE_CONFIG_HOME`/`RICE_STATE_HOME` + `HOME` di-override) dan membuktikan temuan #6: symlink normalisasi `<rice>/<x> -> .config/<x>` membuat target swap `<RICE_HOME>/<name>/<x>` (yang dihitung `switch.py`) resolve ke `<rice>/.config/<x>`, sehingga symlink live `~/.config/<x>` menunjuk ke pohon yang benar.
 
 ### 4.4 Anomali yang dideteksi (bukan gap, tapi diperingatkan)
 - Tak ada config yang dikenal → "rice ini mungkin bukan rice Hyprland".
@@ -203,11 +210,14 @@ Dua bentuk repo:
 ### 4.5 `tomlwrite.py`
 - `tomllib` hanya baca → serializer minimal menulis: string, int, bool, array of string, tabel, array-of-tables.
 - Urutan key mengikuti `docs/PLAN.md §4.1`: **scalar → tabel → array-of-tables**.
-- Tes: round-trip `tomllib.loads(tomlwrite(draft)) == draft` untuk ~15 manifest contoh (termasuk `fixtures/**`).
+- Tes: round-trip `tomllib.loads(tomlwrite(draft)) == draft` pada manifest contoh (termasuk kasus array-of-tables dengan komentar). Catatan: `fixtures/**` **tidak** berisi `rice.toml` — hanya config pihak ketiga (mis. `matugen/config.toml`, `fish/starship.toml`) — jadi round-trip diuji pada manifest sintetis + draf hasil `detect`, bukan pada `fixtures/**`.
 
 ### 4.6 Acceptance (Fase 2)
-- `detect` pada fixture `fixtures/hyprland`, `fixtures/waybar`, `fixtures/quickshell`, `fixtures/illogical-impulse` menghasilkan komponen yang diharapkan.
-- Field `stop`/`argv_match` ambigu ditandai `ask` (bukan dipaksakan).
+- `detect` pada rice yang dibangun dari fixture (`fixtures/hyprland.lua` + `fixtures/hyprland`, `fixtures/waybar`, `fixtures/quickshell`) menghasilkan komponen yang diharapkan. `fixtures/illogical-impulse` adalah **direktori data** (berisi `actions/`, `config.json`), bukan sinyal komponen, dan tidak dipakai sebagai fixture deteksi.
+- Autostart dari berkas **tak terjangkau** (arsip/profil/backup) diabaikan; hanya berkas terjangkau dari entrypoint yang menghasilkan komponen.
+- Tidak ada entrypoint terbaca ⇒ dilaporkan ("tidak ada entrypoint"), **bukan** fallback pindai-semua.
+- Perintah gabungan dipecah dan wrapper dilewati; identitas diturunkan dari argv literal (tanpa argumen ⇒ `exact_argv = true`).
+- Field yang ambigu ditandai `ask` (bukan dipaksakan).
 - Round-trip TOML hijau.
 
 ---
