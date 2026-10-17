@@ -679,6 +679,64 @@ def cmd_import(args, roots: Roots, log) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Subcommand: clone (Fase 1 — clone + naming only)
+# ---------------------------------------------------------------------------
+
+def cmd_clone(args, roots: Roots, log) -> int:
+    """Clone a third-party rice repo into rice_home.
+
+    This only clones: it does not generate a `rice.toml` and does not
+    touch state. Insecure schemes (`http://`, `git://`) print a warning
+    and require confirmation unless `--yes` is given.
+    """
+    from .clone import (
+        derive_name,
+        do_clone,
+        redact_url,
+        validate_branch,
+        validate_depth,
+        validate_url,
+    )
+
+    url = args.url
+    check = validate_url(url, allow_local=bool(args.allow_local))
+    if not check.ok:
+        print(f"error: {check.error}", file=sys.stderr)
+        return 2
+    if check.needs_confirm and not args.yes:
+        print(f"warning: {check.warning}", file=sys.stderr)
+        if not _confirm_prompt(f"Clone from {redact_url(url)} ?"):
+            print("aborted.", file=sys.stderr)
+            return 1
+
+    name = args.name if args.name else derive_name(url)
+    for ok, err in (
+        validate_rice_name(name),
+        validate_depth(args.depth),
+        validate_branch(args.branch),
+    ):
+        if not ok:
+            print(f"error: {err}", file=sys.stderr)
+            return 2
+
+    res = do_clone(
+        url,
+        name,
+        roots,
+        depth=args.depth,
+        branch=args.branch,
+        allow_local=bool(args.allow_local),
+    )
+    if not res.ok:
+        print(f"error: {res.error}", file=sys.stderr)
+        return 2 if res.rc == 2 else 1
+    for w in res.warnings:
+        print(f"warning: {w}", file=sys.stderr)
+    print(f"cloned {res.redacted_url} -> {res.path}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Subcommand: diff (Slice 4)
 # ---------------------------------------------------------------------------
 
@@ -890,6 +948,23 @@ def build_parser() -> argparse.ArgumentParser:
     im.add_argument("--apply", dest="dry_run", action="store_false",
                     help="actually copy the files into rice_home")
 
+    cl = sub.add_parser(
+        "clone",
+        help="clone a third-party rice repo into rice_home (no manifest, no state)",
+    )
+    cl.add_argument("url")
+    cl.add_argument("--name", default=None,
+                    help="rice name (default: derived from the URL)")
+    cl.add_argument("--depth", default=None,
+                    help="shallow clone depth (positive integer)")
+    cl.add_argument("--branch", default=None,
+                    help="branch to check out")
+    cl.add_argument("--allow-local", dest="allow_local", action="store_true",
+                    default=False,
+                    help="allow file:// URLs and local paths (offline/tests)")
+    cl.add_argument("--yes", action="store_true", default=False,
+                    help="accept insecure http:// or git:// without prompting")
+
     df = sub.add_parser(
         "diff",
         help="show unified diff between two installed rice (rice.toml)",
@@ -954,6 +1029,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "apply": cmd_apply,
         "menu": cmd_menu,
         "import": cmd_import,
+        "clone": cmd_clone,
         "diff": cmd_diff,
         "edit": cmd_edit,
     }

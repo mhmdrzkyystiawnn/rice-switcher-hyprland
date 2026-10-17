@@ -20,6 +20,7 @@ from dataclasses import dataclass
 #   * at most 64 chars
 #   * only [A-Za-z0-9._-] (no path separators, no whitespace, no quotes)
 #   * not "." or ".."
+#   * must not start with "." (hidden dirs collide with clone temp dirs)
 #   * not absolute (no leading / or ~)
 # These rules are enforced BEFORE any directory or file is created, so
 # a rejected name leaves the filesystem untouched. The same rules are
@@ -39,6 +40,10 @@ def validate_rice_name(name: str) -> tuple[bool, str]:
         return False, f"rice name too long ({len(name)} > 64 chars)"
     if name in (".", ".."):
         return False, f"rice name {name!r} is reserved"
+    if name.startswith("."):
+        # A leading dot would hide the rice dir and can collide with the
+        # clone temp dirs (".<name>.tmp-<pid>"). Reject it outright.
+        return False, f"rice name must not start with a dot (got {name!r})"
     if os.path.isabs(name) or name.startswith("~"):
         return False, f"rice name must not be an absolute path (got {name!r})"
     if "/" in name or "\\" in name:
