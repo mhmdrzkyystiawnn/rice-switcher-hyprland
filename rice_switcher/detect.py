@@ -227,14 +227,28 @@ class LayoutLink:
 class Finding:
     """A gap/attention item surfaced during review (DESIGN §6).
 
-    Fase 3a only displays findings; Fase 4 fills `decision`
-    (`pending` / `approved` / `skipped`) after an explicit user approve.
+    Fase 3a only displays findings; Fase 4 fills them from the detector.
+    `decision` is `pending` until a human handles the item (an option id,
+    or `skipped`); `--yes` refuses to save while any is `pending`.
+
+    The extra fields carry the structured payload the review driver needs:
+    `autostart_conflict` uses `component`/`refs`/`options`/`default_option`;
+    `needs_materialization` uses `path`.
     """
 
     kind: str = ""
     title: str = ""
     detail: str = ""
     decision: str = "pending"
+    component: str = ""
+    refs: list[tuple[str, int, str]] = field(default_factory=list)  # (file, line, kind)
+    options: list[str] = field(default_factory=list)
+    default_option: str = ""
+    path: str = ""
+
+    @property
+    def is_resolved(self) -> bool:
+        return self.decision != "pending"
 
 
 @dataclass
