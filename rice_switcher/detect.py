@@ -224,6 +224,20 @@ class LayoutLink:
 
 
 @dataclass
+class Finding:
+    """A gap/attention item surfaced during review (DESIGN §6).
+
+    Fase 3a only displays findings; Fase 4 fills `decision`
+    (`pending` / `approved` / `skipped`) after an explicit user approve.
+    """
+
+    kind: str = ""
+    title: str = ""
+    detail: str = ""
+    decision: str = "pending"
+
+
+@dataclass
 class LayoutResult:
     name: str
     created: bool
@@ -243,6 +257,7 @@ class ManifestDraft:
     notes: list[str] = field(default_factory=list)
     autostart_refs: list[AutostartRef] = field(default_factory=list)
     layout: LayoutInfo = field(default_factory=LayoutInfo)
+    findings: list[Finding] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
