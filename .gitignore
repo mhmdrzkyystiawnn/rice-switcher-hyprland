@@ -51,3 +51,6 @@ Thumbs.db
 **/user/generated/wallpaper/path.txt
 **/user/generated/terminal/sequences.txt
 **/user/generated/terminal/kitty-theme.conf
+
+# Local planning notes (kept out of the repo)
+PLAN.md
