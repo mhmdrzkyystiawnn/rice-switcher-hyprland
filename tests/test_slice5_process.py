@@ -618,5 +618,77 @@ class SwitchProcessTest(unittest.TestCase):
         self.assertEqual(read_state(self.roots).current_rice, "A")
 
 
+class AdoptCommandTest(unittest.TestCase):
+    """`adopt` records the running desktop as a rice without swapping."""
+
+    def setUp(self):
+        self.roots, self._td = _tmp_roots()
+        self._write_rice("A", "quickshell")
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def _write_rice(self, name, shell):
+        _write_manifest(
+            self.roots, name,
+            _HYPR.format(
+                name=name, shell=shell,
+                hypr=os.path.join(self.roots.config_home, "hypr"),
+                shell_link=os.path.join(self.roots.config_home, shell),
+            ),
+        )
+        os.makedirs(os.path.join(rice_dir(self.roots, name), "hypr"), exist_ok=True)
+        os.makedirs(os.path.join(rice_dir(self.roots, name), shell), exist_ok=True)
+
+    @staticmethod
+    def _args(name):
+        from argparse import Namespace
+        return Namespace(name=name, cmd="adopt")
+
+    def test_adopt_sets_current_without_touching_files(self):
+        from rice_switcher.cli import cmd_adopt
+        rt = FakeRuntime()
+        rt.up.add("quickshell")
+        rc = cmd_adopt(self._args("A"), self.roots, None, runtime=rt)
+        self.assertEqual(rc, 0)
+        self.assertEqual(read_state(self.roots).current_rice, "A")
+        # Nothing was swapped: no symlink created at the config_link.
+        self.assertFalse(os.path.lexists(os.path.join(self.roots.config_home, "quickshell")))
+
+    def test_adopt_unknown_rice_errors_and_keeps_state(self):
+        from rice_switcher.cli import cmd_adopt
+        rc = cmd_adopt(self._args("nope"), self.roots, None, runtime=FakeRuntime())
+        self.assertEqual(rc, 2)
+        self.assertEqual(read_state(self.roots).current_rice, "")
+
+    def test_adopt_is_idempotent(self):
+        from rice_switcher.cli import cmd_adopt
+        rt = FakeRuntime()
+        self.assertEqual(cmd_adopt(self._args("A"), self.roots, None, runtime=rt), 0)
+        self.assertEqual(cmd_adopt(self._args("A"), self.roots, None, runtime=rt), 0)
+        self.assertEqual(read_state(self.roots).current_rice, "A")
+
+    def test_adopted_shell_is_stopped_by_next_switch(self):
+        # The point of adopt: an unregistered desktop was never stopped.
+        from rice_switcher.cli import cmd_adopt
+        rt = FakeRuntime()
+        rt.up.add("quickshell")
+        rt.effects["quickshell-stop"] = ("quickshell", False)
+        rt.effects["waybar-start"] = ("waybar", True)
+        self.assertEqual(cmd_adopt(self._args("A"), self.roots, None, runtime=rt), 0)
+
+        self._write_rice("B", "waybar")
+        a = load_manifest(manifest_path(self.roots, "A"))
+        b = load_manifest(manifest_path(self.roots, "B"))
+        outcome = do_switch(
+            self.roots, "B", [a, b],
+            dry_run=False, manage_processes=True, runtime=rt,
+        )
+        self.assertEqual(outcome.errors, [])
+        self.assertTrue(rt.ran("quickshell-stop"))
+        self.assertNotIn("quickshell", rt.up)
+        self.assertIn("waybar", rt.up)
+
+
 if __name__ == "__main__":
     unittest.main()

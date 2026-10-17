@@ -89,6 +89,7 @@ The compositor (`type = "compositor"`) is never stopped or started. Steps 8–14
 - **Undo irreversible steps.** `[hooks]`, `theme.apply` and matugen cannot be undone; rollback restores files/symlinks and best-effort restarts processes, but does not reverse those.
 - **Guarantee every stopped process returns.** A component whose `start` is broken will not come back; check the audit log.
 - **Touch components outside the managed set** (`gnome-keyring`, `geoclue`, `ydotool`, `cliphist_*`, …) — those are never managed.
+- **Stop a desktop it does not know about.** `switch` only stops the components declared by the *current* rice. If the running session was never registered (`state.current_rice` empty), the plan has nothing to stop and the target's components are layered on top of the existing ones. Register the running session first with `rice-switcher adopt <name>` (a manifest that declares the components you already run, e.g. a `quickshell` component with `executable = "qs"`, `argv_match = ["-c", "ii"]`), then `switch` will stop them — and `rollback` will start them again.
 
 See [Not yet implemented](#not-yet-implemented) for the rest of the roadmap.
 
@@ -175,6 +176,7 @@ All of the following are implemented.
 | `rice-switcher add <name>` | Scaffold `<RICE_HOME>/<name>/rice.toml` from a template. Refuses to overwrite an existing manifest; does **not** copy your current config. |
 | `rice-switcher list` | List available rices (directories that contain a `rice.toml`). |
 | `rice-switcher current` | Print the active rice from `state.json` (or a "never switched" message). |
+| `rice-switcher adopt <name>` | Record the **running** desktop as `<name>` without swapping anything, so the next `switch` knows which components to stop. Use it once for a rice that was already installed by hand. |
 | `rice-switcher status` | Table per rice: symlink state, symlink owner, probed component PIDs, drift, last-switch time. |
 | `rice-switcher validate <name>` | Deep validation: schema, binaries, `config_link`, Hyprland config, matugen templates. Exit 1 if errors. |
 | `rice-switcher switch <name> [--dry-run] [--no-dry-run]` | Switch to a rice. See [How it works](#what-switch-does-today). Default dry-run. |

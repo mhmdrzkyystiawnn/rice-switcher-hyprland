@@ -173,6 +173,57 @@ def cmd_current(args, roots: Roots, log) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Subcommand: adopt
+# ---------------------------------------------------------------------------
+
+def cmd_adopt(args, roots: Roots, log, *, runtime=None) -> int:
+    """Record the running desktop as `name` WITHOUT swapping anything.
+
+    Use this when the current session is a rice that was installed by
+    hand (or predates rice-switcher): it tells the switcher which rice
+    is active, so a later `switch` knows which components to stop and a
+    `rollback` knows which to restart.
+    """
+    rices = list_manifests(roots.rice_home)
+    match = next((p for n, p in rices if n == args.name), None)
+    if match is None:
+        print(f"error: no rice named {args.name!r}", file=sys.stderr)
+        return 2
+    try:
+        m = load_manifest(match)
+    except Exception as e:
+        print(f"error: failed to parse manifest: {e}", file=sys.stderr)
+        return 1
+
+    st = read_state(roots)
+    if st.current_rice == args.name:
+        print(f"already on {args.name!r}; nothing to do")
+        return 0
+    from .state import write_state
+    st.current_rice = args.name
+    write_state(roots, st)
+
+    if runtime is None:
+        from .lifecycle import Runtime
+        runtime = Runtime()
+    up: list[str] = []
+    down: list[str] = []
+    for c in m.components:
+        if c.type == "compositor":
+            continue
+        try:
+            (up if runtime.is_running(c) else down).append(c.name)
+        except Exception:
+            down.append(c.name)
+    print(f"adopted {args.name!r} (state.current_rice = {args.name!r})")
+    if up:
+        print(f"  running now: {', '.join(up)}")
+    if down:
+        print(f"  not running: {', '.join(down)}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Subcommand: status
 # ---------------------------------------------------------------------------
 
@@ -790,6 +841,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("list", help="list all rice directories")
     sub.add_parser("current", help="print the current rice (from state.json)")
+    ad = sub.add_parser(
+        "adopt",
+        help="record the running desktop as <name> without switching",
+    )
+    ad.add_argument("name")
     val = sub.add_parser("validate", help="comprehensive validation of a rice manifest")
     val.add_argument("name")
     sub.add_parser("status", help="table of rice x component x last-switch")
@@ -880,6 +936,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "add": cmd_add,
         "list": cmd_list,
         "current": cmd_current,
+        "adopt": cmd_adopt,
         "status": cmd_status,
         "switch": cmd_switch,
         "snapshot": cmd_snapshot,
