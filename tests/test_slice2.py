@@ -385,7 +385,9 @@ class AuditRotationTest(unittest.TestCase):
             self.assertTrue(os.path.isfile(archived[0]))
             self.assertRegex(
                 os.path.basename(archived[0]),
-                r"^audit-\d{8}-\d{6}-\d{5}-\d{3}\.log$",
+                # PID is `{pid:05d}` and the counter `{counter:03d}`, so both
+                # fields are at least 5 / 3 digits (pid_max can exceed 99999).
+                r"^audit-\d{8}-\d{6}-\d{5,}-\d{3,}\.log$",
             )
         finally:
             del os.environ["RICE_AUDIT_ROTATE_MAX_BYTES"]

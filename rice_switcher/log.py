@@ -175,7 +175,10 @@ def log_to_file(roots, name: str, level: int = logging.INFO) -> logging.Logger:
 # ---------------------------------------------------------------------------
 
 _ARCHIVE_NAME_RE = re.compile(
-    r"^audit-(\d{8})-(\d{6})-(\d{5})-(\d{3})\.log$"
+    # PID is `{pid:05d}` (5+ digits; pid_max can be larger than 99999) and
+    # the counter is `{counter:03d}` (3+ digits). Use `+` quantifiers or a
+    # 6-digit PID makes the scan miss existing archives and collide.
+    r"^audit-(\d{8})-(\d{6})-(\d{5,})-(\d{3,})\.log$"
 )
 
 
