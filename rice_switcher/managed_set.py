@@ -18,14 +18,22 @@ from .manifest import Component, Manifest
 class Identity:
     executable: str
     argv_match: tuple[str, ...] = ()
+    exact: bool = False
 
     @classmethod
     def from_component(cls, c: Component) -> "Identity":
         exe = c.executable or c.name
-        return cls(exe, tuple(c.argv_match))
+        return cls(exe, tuple(c.argv_match), bool(c.exact_argv))
 
     def __str__(self) -> str:
         argv = " " + " ".join(self.argv_match) if self.argv_match else ""
+        if self.exact:
+            # Make the match mode explicit in the confirmation view
+            # (PLAN.md §2h): a no-argument identity must be readable as
+            # such, not as a bare basename.
+            if not self.argv_match:
+                return f"{self.executable} (exact: no args)"
+            return f"{self.executable}{argv} (exact)"
         return f"{self.executable}{argv}"
 
 

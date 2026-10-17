@@ -2,7 +2,20 @@
 
 PLAN.md §2g. We do NOT use `pkill -f` (too broad). Instead, we scan
 `/proc/<pid>/cmdline` for an exact match of the executable basename plus
-a subset match on `argv_match` tokens.
+a match on `argv_match` tokens.
+
+Two match modes (Fase 2b Langkah 1):
+
+  * **subset** (default, legacy): every token in `argv_match` must be
+    present in argv, order-independent. `argv_match` must be non-empty.
+  * **exact** (`exact=True`, declared via the manifest field
+    `exact_argv`): argv (after the executable) must equal `argv_match`
+    exactly — same tokens, same order, no extras. An **empty**
+    `argv_match` with `exact=True` therefore means "the executable with
+    no arguments", which is how an argument-less daemon (waybar,
+    hypridle, mako, dunst) gets a stoppable identity. This is still not
+    a basename-only match: the process's argv must have exactly one
+    element.
 
 Enumeration (`find_pids_by_identity`, `probe_pids_by_identity`) is
 read-only. The signalling path lives in `terminate_by_identity`
@@ -14,6 +27,7 @@ basename-only match.
 
 from __future__ import annotations
 
+import functools
 import os
 import re
 import signal
@@ -62,19 +76,45 @@ def identity_from_argv(argv: list[str]) -> tuple[str, tuple[str, ...]] | None:
     return (exe, tuple(argv[1:]))
 
 
+def argv_matches(
+    tokens: tuple[str, ...] | list[str],
+    argv_match: tuple[str, ...] | list[str],
+    *,
+    exact: bool = False,
+) -> bool:
+    """True if a process's argv tokens satisfy the declared identity.
+
+    `exact=False` (legacy): subset match, order-independent. Every token
+    in `argv_match` must be present in `tokens`; extras are allowed.
+
+    `exact=True` (Fase 2b Langkah 1): `tokens` must equal `argv_match`
+    exactly (same tokens, same order, no extras). An empty `argv_match`
+    matches only a process whose argv is the executable alone.
+    """
+    if exact:
+        return tuple(tokens) == tuple(argv_match)
+    return all(tok in tokens for tok in tuple(argv_match))
+
+
 def find_pids_by_identity(
     executable: str,
     argv_match: tuple[str, ...] | list[str] = (),
     *,
+    exact: bool = False,
     exclude_self: bool = True,
     extra_exclude_pids: tuple[int, ...] = (),
 ) -> list[int]:
-    """Return PIDs whose argv[0] basename == `executable` AND every token
-    in `argv_match` is present in their argv (subset match, order-independent).
+    """Return PIDs whose argv[0] basename == `executable` AND whose argv
+    tokens satisfy `argv_match`.
 
-    Per PLAN.md §2g, this is the disambiguator for processes like
-    `qs -c ii` vs `qs -c minimal`: both have basename `qs`, but their
-    argv_match differ.
+    With `exact=False` (default) the match is a subset match
+    (order-independent, extras allowed). With `exact=True` the tokens
+    must equal `argv_match` exactly; an empty `argv_match` then selects
+    only argument-less processes (Fase 2b Langkah 1).
+
+    Per PLAN.md §2g, the subset mode is the disambiguator for processes
+    like `qs -c ii` vs `qs -c minimal`: both have basename `qs`, but
+    their argv_match differ.
 
     Caller-supplied PIDs (`extra_exclude_pids`) are filtered out, in
     addition to self/parent when `exclude_self=True`. We exclude self
@@ -103,7 +143,7 @@ def find_pids_by_identity(
         exe, tokens = ident
         if exe != executable:
             continue
-        if not all(tok in tokens for tok in argv_match):
+        if not argv_matches(tokens, argv_match, exact=exact):
             continue
         out.append(pid)
     return out
@@ -128,13 +168,16 @@ def pid_matches_identity(
     pid: int,
     executable: str,
     argv_match: tuple[str, ...] | list[str] = (),
+    *,
+    exact: bool = False,
 ) -> bool:
     """Re-read `/proc/<pid>/cmdline` and confirm it still matches.
 
     Used immediately before signalling to defeat PID reuse: between the
     scan and the kill, the PID may have been recycled by an unrelated
     process. A missing, unreadable or empty (zombie) cmdline returns
-    False, as does a different basename or missing argv token.
+    False, as does a different basename or a non-matching argv (subset
+    by default, exact with `exact=True`; see `argv_matches`).
     """
     argv = read_cmdline(pid)
     if not argv:
@@ -145,13 +188,14 @@ def pid_matches_identity(
     exe, tokens = ident
     if exe != executable:
         return False
-    return all(tok in tokens for tok in tuple(argv_match))
+    return argv_matches(tokens, argv_match, exact=exact)
 
 
 def terminate_by_identity(
     executable: str,
     argv_match: tuple[str, ...] | list[str],
     *,
+    exact: bool = False,
     timeout: float = 10.0,
     sigterm: int = signal.SIGTERM,
     sigkill: int = signal.SIGKILL,
@@ -168,10 +212,14 @@ def terminate_by_identity(
     Guards (DESIGN-onboarding-tui.md §4.2):
 
     * own uid only; never PID 1, this process, or its parent;
-    * `argv_match` is **required** — a basename-only match is too broad
-      (`qs -c ii` and `qs -c minimal` share the basename `qs`);
+    * `argv_match` is **required** unless `exact=True` declares an
+      identity explicitly: a basename-only match is too broad
+      (`qs -c ii` and `qs -c minimal` share the basename `qs`). With
+      `exact=True`, an empty `argv_match` is allowed and means "the
+      executable with no arguments" — still not basename-only, because
+      the argv must have exactly one element (Fase 2b Langkah 1);
     * `/proc/<pid>/cmdline` is re-read right before each signal (PID
-      reuse guard);
+      reuse guard), with the same exact/subset semantics;
     * SIGTERM, wait up to `timeout`, then SIGKILL the survivors.
 
     All side effects go through the injected
@@ -179,10 +227,16 @@ def terminate_by_identity(
     drive it deterministically without touching a real process. Returns
     the PIDs that were sent SIGTERM.
     """
+    argv_match = tuple(argv_match)
+
+    # Bind the default seams to the requested match mode, while keeping
+    # the injected seams' (executable, argv_match) 2-arg signature.
     if find is None:
-        find = find_pids_by_identity
+        find = (functools.partial(find_pids_by_identity, exact=True)
+                if exact else find_pids_by_identity)
     if matches is None:
-        matches = pid_matches_identity
+        matches = (functools.partial(pid_matches_identity, exact=True)
+                   if exact else pid_matches_identity)
     if owned is None:
         owned = is_own_uid
     if kill is None:
@@ -192,11 +246,11 @@ def terminate_by_identity(
     if clock is None:
         clock = time.monotonic
 
-    argv_match = tuple(argv_match)
-    if not argv_match:
+    if not argv_match and not exact:
         raise ValueError(
             "refusing to kill by basename alone: argv_match is required "
-            f"(executable={executable!r})"
+            f"(executable={executable!r}); set exact_argv=true to declare "
+            f"an explicit no-argument identity"
         )
 
     forbidden = {1}
@@ -286,6 +340,7 @@ def probe_pids_by_identity(
     executable: str,
     argv_match: tuple[str, ...] | list[str] = (),
     *,
+    exact: bool = False,
     exclude_self: bool = True,
     extra_exclude_pids: tuple[int, ...] = (),
 ) -> ProbeResult:
@@ -297,7 +352,7 @@ def probe_pids_by_identity(
     The status is determined solely by whether `list_all_pids()` could
     read /proc. Per-PID read errors are silently skipped and do not
     change the overall status. The wrapper has the SAME argv_match
-    semantics as `find_pids_by_identity` above.
+    semantics as `find_pids_by_identity` above (`exact` included).
     """
     try:
         all_pids = list_all_pids()
@@ -324,7 +379,7 @@ def probe_pids_by_identity(
         exe, tokens = ident
         if exe != executable:
             continue
-        if not all(tok in tokens for tok in argv_match):
+        if not argv_matches(tokens, argv_match, exact=exact):
             continue
         out.append(pid)
     return ProbeResult(

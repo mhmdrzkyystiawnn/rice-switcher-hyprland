@@ -17,7 +17,8 @@ Versi publik: docs/PLAN.md (seksi 2–7 + keputusan). File ini lokal, jangan di-
 | `name` | ya | identifier unik dalam satu rice. Dipakai oleh `depends_on` |
 | `type` | ya | `bar` \| `shell` \| `notifications` \| `locker` \| `wallpaper` \| `compositor` \| `terminal` \| `launcher` \| `theme_generator` \| `color_daemon` \| `system` (geoclue, dbus, audio, dll.) \| `clipboard` |
 | `executable` | tidak (default = `name`) | basename executable untuk process identity (§2g). Mis. Quickshell: `"qs"` |
-| `argv_match` | tidak (default = `[]`) | list token yang HARUS ada di argv. Disambiguator `qs -c ii` vs `qs -c minimal` (§2g) |
+| `argv_match` | tidak (default = `[]`) | list token yang HARUS ada di argv (subset, urutan tidak penting). Disambiguator `qs -c ii` vs `qs -c minimal` (§2g) |
+| `exact_argv` | tidak (default = `false`) | bila `true`, argv proses harus **sama persis** dengan `executable` + `argv_match` (urutan penting, tanpa token tambahan). `exact_argv=true` + `argv_match=[]` menyatakan identitas **tanpa argumen** untuk daemon seperti waybar/hypridle (§2g) |
 | `start` | ya* | command untuk start. Boleh pakai placeholder `{config_link}` |
 | `stop` | ya* | command stop. Boleh `true` (noop) untuk komponen yang tidak di-manage (lihat §2c) |
 | `stop_check` | tidak | cara verifikasi proses sudah mati (default: identity scan via `/proc`, lihat §2g) |
@@ -340,8 +341,26 @@ Setelah normalisasi (`os.path.abspath + os.path.expanduser`, **TANPA** realpath 
 |---|---|---|
 | `executable` | tidak (default = `name`) | basename executable di `/proc/<pid>/comm` atau argv[0] basename. Mis. untuk Quickshell: `"qs"`. |
 | `argv_match` | tidak (default = `[]`) | list token yang HARUS ada di argv proses (urutan tidak penting, semua harus match). Mis. untuk `qs -c ii`: `["-c", "ii"]`. |
+| `exact_argv` | tidak (default = `false`) | bila `true`, mode match berubah jadi **exact**: argv proses (setelah executable) harus sama persis dengan `argv_match` — jumlah, isi, dan urutan. `exact_argv=true` + `argv_match=[]` = identitas **tanpa argumen**. Lihat "Identitas tanpa argumen" di bawah. |
 
 **Mengapa perlu lebih dari basename**: dua Quickshell (`qs -c ii` dan `qs -c minimal`) memiliki executable basename `"qs"` yang **sama**. Membedakan mereka dengan basename saja akan salah identity — algoritma akan menganggap `qs -c minimal` (baru) sama dengan `qs -c ii` (lama) dan tidak melakukan apa-apa. `argv_match` adalah disambiguator.
+
+**Identitas tanpa argumen (`exact_argv`, Fase 2b Langkah 1).** Daemon yang tidak menerima argumen (mis. `waybar`, `hypridle`, `mako`, `dunst`) tidak punya token `argv_match` yang bisa dipakai untuk membedakannya — subset match dengan `argv_match=[]` terlalu luas karena cocok dengan **semua** proses yang basename-nya sama (termasuk `waybar -c x`). Karena itu `terminate_by_identity` menolak `argv_match` kosong. Untuk memberi daemon seperti itu identitas yang bisa dihentikan, manifest boleh menyatakan secara eksplisit:
+
+```toml
+[[components]]
+name = "waybar"
+type = "bar"
+executable = "waybar"
+exact_argv = true      # identitas: argv tepat ["waybar"], tanpa argumen
+stop = ""              # stop berbasis identitas (§4.2)
+```
+
+Aturan:
+- `exact_argv=true` mengubah match menjadi **equality** (bukan subset): `argv_proses == argv_match` dan `basename(argv[0]) == executable`. Urutan penting; tidak boleh ada token tambahan **atau** kurang.
+- `exact_argv=true` + `argv_match=[]` hanya cocok dengan proses yang argv-nya **satu elemen** (executable itu saja). Ini **bukan** basename-only: `waybar -c x` tidak ikut cocok.
+- `argv_match=[]` **tanpa** `exact_argv` tetap **error** — tidak ada arti implisit "tanpa argumen".
+- Manifest lama yang memakai `argv_match` (subset) **tidak berubah perilakunya**: `exact_argv` default `false`, dan semua guard lama (uid sendiri, bukan PID 1/diri/parent, baca ulang `/proc/<pid>/cmdline` sebelum sinyal, SIGTERM→tunggu→SIGKILL, compositor ditolak) tetap berlaku.
 
 **Algoritma scan `/proc/*/cmdline`** (PLAN.md §2g):
 ```python

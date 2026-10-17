@@ -27,6 +27,7 @@ class Component:
     type: str
     executable: str = ""
     argv_match: list[str] = field(default_factory=list)
+    exact_argv: bool = False
     start: str = ""
     stop: str = "true"
     stop_check: str = ""
@@ -122,6 +123,9 @@ def _coerce_component(raw: dict, idx: int) -> Component:
     argv = raw.get("argv_match", [])
     if not isinstance(argv, list) or not all(isinstance(x, str) for x in argv):
         raise ManifestError(f"components[{idx}] (name={name!r}): argv_match must be list[str]")
+    exact_argv = raw.get("exact_argv", False)
+    if not isinstance(exact_argv, bool):
+        raise ManifestError(f"components[{idx}] (name={name!r}): exact_argv must be bool")
     deps = raw.get("depends_on", [])
     if not isinstance(deps, list) or not all(isinstance(x, str) for x in deps):
         raise ManifestError(f"components[{idx}] (name={name!r}): depends_on must be list[str]")
@@ -133,6 +137,7 @@ def _coerce_component(raw: dict, idx: int) -> Component:
         type=ctype,
         executable=raw.get("executable", ""),
         argv_match=argv,
+        exact_argv=exact_argv,
         start=raw.get("start", ""),
         stop=raw.get("stop", "true"),
         stop_check=raw.get("stop_check", ""),

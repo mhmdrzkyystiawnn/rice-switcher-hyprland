@@ -79,7 +79,8 @@ class Runtime:
             return bool(self.probe(c))
         if c.start_check:
             return self.run(c.start_check).ok
-        res = probe_pids_by_identity(c.executable or c.name, c.argv_match)
+        res = probe_pids_by_identity(c.executable or c.name, c.argv_match,
+                                     exact=bool(c.exact_argv))
         return res.status == "running"
 
     def kill_processes(self, c: Component) -> list[int]:
@@ -93,6 +94,7 @@ class Runtime:
         return terminate_by_identity(
             c.executable or c.name,
             tuple(c.argv_match),
+            exact=bool(c.exact_argv),
             timeout=float(c.timeout),
         )
 
@@ -153,20 +155,23 @@ def stop_component(rt: Runtime, c: Component, *, audit: AuditFn | None = None) -
             )
     else:
         # Prasyarat 0 (DESIGN-onboarding-tui.md §4.2): no `stop` command
-        # declared -> stop by process identity. `argv_match` is
-        # mandatory here: a basename-only kill would also hit an
-        # unrelated instance (e.g. `qs -c minimal`).
-        if not c.argv_match:
+        # declared -> stop by process identity. A full identity is
+        # mandatory: either `argv_match` (subset) or an explicit
+        # `exact_argv` declaration (which allows the no-argument case).
+        # A bare basename kill would also hit an unrelated instance
+        # (e.g. `qs -c minimal`).
+        ident = Identity.from_component(c)
+        if not c.argv_match and not c.exact_argv:
             if c.optional:
                 return
             raise LifecycleError(
                 f"component {c.name!r}: cannot stop by identity without "
-                f"argv_match (refusing a basename-only kill)"
+                f"argv_match (refusing a basename-only kill); set "
+                f"exact_argv=true for a no-argument process"
             )
         rt.kill_processes(c)
         if audit:
-            label = f"{c.executable or c.name} {' '.join(c.argv_match)}".strip()
-            audit("stop.identity", c.name, label, None)
+            audit("stop.identity", c.name, str(ident), None)
     if not rt.wait_for(lambda: not rt.is_running(c), float(c.timeout)):
         if c.optional:
             return
