@@ -124,7 +124,7 @@ Dokumen ini merancang tepat sebatas batas itu: yang **BISA** dibuat penuh, dan y
 
 **Validasi URL sebelum clone:**
 - **Tolak** URL yang diawali `-` (mis. `--upload-pack=…`) — `git` akan membacanya sebagai opsi → argument injection.
-- **Batasi protokol**: allowlist `https://`, `http://`, `git://`, `ssh://`, dan bentuk scp `git@host:path`. **Blokir** `ext::` dan skema lain (`file://` hanya bila `--allow-local` eksplisit, untuk tes).
+- **Batasi protokol**: default aman = **`https://`** dan **`ssh://`** (+ bentuk scp `git@host:path`). **`http://`/`git://` tidak terenkripsi** → tetap diizinkan tapi **beri peringatan + konfirmasi**. **Blokir** `ext::` dan skema lain (`file://` hanya dengan `--allow-local` eksplisit, untuk tes).
 - Tolak URL yang mengandung karakter kontrol/newline.
 
 **Eksekusi:**
@@ -163,7 +163,7 @@ Inti fitur. Menghasilkan `ManifestDraft` (bukan final). Sumber inferensi utama =
 
 Contoh nyata (elifouts): `execs.lua:6 → hl.exec_cmd("qs -c $qsConfig")` + `variables.lua:5 → hl.env("qsConfig","ii")` ⇒ komponen quickshell `qs -c ii`. Parser harus mengikuti indireksi variabel ini.
 
-**⚠ Autostart bentrok (temuan baru — wajib, lihat §6.1).** Baris autostart itu **tetap ada** di config rice. Kalau detector menjadikannya komponen terkelola, `switch` akan **start** komponen itu, sementara `exec-once`/`exec` di config juga menjalankannya → **start ganda**, atau **saling bunuh** saat reload (`exec` jalan ulang tiap `hyprctl reload`; `exec-once` hanya sekali). Karena itu detector **wajib** memunculkan temuan "autostart bentrok" dengan dua opsi penanganan (§6.1) — **tidak** diam-diam membuat komponen start+stop.
+**⚠ Autostart bentrok (temuan baru — wajib, lihat §6.1).** Baris autostart itu **tetap ada** di config rice. Kalau detector menjadikannya komponen terkelola, `switch` akan **start** komponen itu, sementara `exec-once`/`exec` di config juga menjalankannya → **start ganda**, atau **saling bunuh** saat reload (`exec` jalan ulang tiap `hyprctl reload`; `exec-once` hanya sekali). Karena itu detector **wajib** memunculkan temuan "autostart bentrok" dengan dua opsi penanganan (§6.1) — **default Opsi B** ("dijalankan oleh config": switcher hanya stop) — **tidak** diam-diam membuat komponen start+stop.
 
 ### 4.2 Yang butuh keputusan / perhatian user
 - **`stop` → dikosongkan (keputusan #2).** Generator **tidak mengisi `stop`** dan **tidak menebak `pkill -x`**. `stop` kosong → `stop_component` memakai stop bawaan berbasis PID (identitas `executable` + `argv_match`, `PLAN.md §2g`). Ini bergantung pada **Prasyarat 0** (§12): kill-by-identity di `process.py`/`lifecycle.py`; tanpa itu `stop` kosong = jalankan `true` lalu **menunggu** → timeout (`lifecycle.py:119-136`). Kalau identitas ambigu → tandai `ask`, jangan mengarang `stop`.
@@ -173,6 +173,14 @@ Contoh nyata (elifouts): `execs.lua:6 → hl.exec_cmd("qs -c $qsConfig")` + `var
 - **Urutan** start antar komponen.
 
 Draft menandai tiap field dengan tingkat keyakinan (`auto` / `guess` / `ask`). TUI menonjolkan yang `guess`/`ask`.
+
+**Guard kill-by-identity (brief Prasyarat 0).** Ini kode baru yang bisa **membunuh proses**, dan `executable`/`argv_match` bisa berasal dari `rice.toml` orang lain. Wajib:
+- Hanya PID milik **uid sendiri**; abaikan **PID 1**, PID switcher sendiri, dan **parent**-nya.
+- Cocokkan **argv lengkap** (identitas `executable` + `argv_match`), **bukan** basename saja — kalau tidak, `qs -c ii` dan `qs -c minimal` dianggap sama. Tolak/lewati bila `argv_match` kosong (terlalu luas).
+- **Baca ulang `/proc/<pid>/cmdline` tepat sebelum kill** (cegah PID reuse).
+- **SIGTERM → tunggu (timeout) → SIGKILL**.
+- **Lindungi proses sesi**: manifest dengan `executable` = `Hyprland`/`systemd`/`dbus-daemon`/`gnome-keyring-daemon` (dan sejenisnya) **ditolak validator** — ada tesnya.
+- **Gerbang konfirmasi menampilkan target**: saat ini konfirmasi `yes` untuk rice baru menampilkan command string, padahal kill-by-identity bukan string → tambahkan baris **"akan menghentikan proses: …"**.
 
 ### 4.3 Layout → `config_link` (keputusan #1)
 Konvensi swap: target = `<RICE_HOME>/<name>/<basename(config_link)>` (`switch.py:268-271`). Artinya config harus ada di **root rice** dengan nama `basename`-nya.
@@ -235,7 +243,7 @@ Dua bentuk repo:
 ### 6.1 Pola yang **bisa** dikenali otomatis
 | Pola | Arti | Saran |
 |---|---|---|
-| **Autostart bentrok**: config menjalankan komponen (`exec-once`/`exec`/`hl.exec_cmd`) yang juga dijadikan komponen terkelola (§4.1) | start ganda / saling bunuh saat reload | **Opsi A**: netralkan baris itu via patch lokal (dicatat, bisa di-revert); **Opsi B**: tandai komponen "dijalankan oleh config" → switcher **hanya stop**, tidak start |
+| **Autostart bentrok**: config menjalankan komponen (`exec-once`/`exec`/`hl.exec_cmd`) yang juga dijadikan komponen terkelola (§4.1) | start ganda / saling bunuh saat reload | **Default: Opsi B** — tandai komponen "dijalankan oleh config" → switcher **hanya stop**, tidak start. **Opsi A** (netralkan baris) hanya untuk baris `exec-once` sederhana; **jangan** untuk Lua (`hl.exec_cmd` di dalam fungsi / pakai variabel — rapuh). |
 | Tak ada config root, tapi ada `profiles/`, `settings.lua`, `variables.lua`, `*.sh` dengan subcommand `apply` | rice butuh **materialisasi** (mis. elifouts: `hypr-profile.sh apply` menghasilkan `hyprland.lua` root) | tambahkan `[hooks].pre` (dengan persetujuan) |
 | Config `@import`/ref ke file yang tak ada & diproduksi tool dikenal (mis. `colors-waybar.css` dari pywal/wal/matugen) | dependency generasi warna | sarankan install/gen atau `[hooks].pre` |
 | Ada `install.sh`/`setup.sh`/`Makefile`/`justfile`/`bootstrap` | kandidat prasyarat | tandai (jangan jalankan) |
