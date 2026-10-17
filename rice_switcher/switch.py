@@ -399,9 +399,59 @@ def _default_hypr_reload():
     return run_argv(["hyprctl", "reload"], timeout=DEFAULT_TIMEOUT)
 
 
+def _reconcile_processes(runtime, current_m, prev_m, logger, audit) -> None:
+    """Bring the running processes in line with a restored rice.
+
+    Stops what the rolled-back (*current*) rice owned and starts what the
+    restored (*prev*) rice needs. Mirrors ``compute_plan``'s rules but
+    tolerates a missing manifest on either side (e.g. rolling back to
+    "no rice"). Best-effort: individual failures are logged, not raised.
+    """
+    from .managed_set import Identity
+
+    def _comps(m) -> dict:
+        if m is None:
+            return {}
+        return {Identity.from_component(c): c for c in m.components}
+
+    cur = _comps(current_m)
+    prev = _comps(prev_m)
+
+    def _is_compositor(c) -> bool:
+        return c is not None and c.type == "compositor"
+
+    stopped = started = 0
+    for ident in sorted(set(cur) - set(prev), key=str):
+        c = cur[ident]
+        if _is_compositor(c):
+            continue
+        try:
+            stop_component(runtime, c, audit=audit)
+            stopped += 1
+        except Exception as exc:
+            logger.warning("rollback: could not stop %s: %s", c.name, exc)
+    for ident in sorted(set(prev) - set(cur), key=str):
+        c = prev[ident]
+        if _is_compositor(c):
+            continue
+        try:
+            start_component(runtime, c, require_running=False, audit=audit)
+            started += 1
+        except Exception as exc:
+            logger.warning("rollback: could not start %s: %s", c.name, exc)
+    logger.info("rollback process reconciliation: stopped=%d started=%d", stopped, started)
+
+
 def do_rollback(roots: Roots, ts: str | None = None, logger=None, *,
-                reload_fn=None) -> tuple[str, list[str]]:
-    """Roll back to a specific (or the latest) committed snapshot."""
+                reload_fn=None, runtime=None,
+                all_manifests=None) -> tuple[str, list[str]]:
+    """Roll back to a specific (or the latest) committed snapshot.
+
+    When ``runtime`` and ``all_manifests`` are supplied, the component
+    processes are reconciled too: components the rolled-back (target)
+    rice started are stopped and components the restored rice needs are
+    started (best-effort), mirroring the failed-switch rollback.
+    """
     if logger is None:
         logger = setup_logging(roots)
     from .snapshot import list_committed, latest_snapshot_link
@@ -417,14 +467,32 @@ def do_rollback(roots: Roots, ts: str | None = None, logger=None, *,
     errors: list[str] = []
     try:
         with switch_lock(roots):
+            target_rice = read_state(roots).current_rice
             restored, rice_name = restore_snapshot(roots, ts)
             logger.info("rolled back to snapshot %s; restored %d paths", ts, len(restored))
+
+            def _audit(kind, name, command, res):
+                append_audit(roots, {
+                    "action": "exec",
+                    "kind": kind,
+                    "component": name or None,
+                    "command": command,
+                    "rc": None if res is None else res.rc,
+                    "timed_out": None if res is None else res.timed_out,
+                })
+
+            # Reconcile processes with the restored rice (best-effort).
+            if runtime is not None and all_manifests is not None:
+                prev_m = next((m for m in all_manifests if m.meta.name == rice_name), None)
+                cur_m = next((m for m in all_manifests if m.meta.name == target_rice), None)
+                _reconcile_processes(runtime, cur_m, prev_m, logger, _audit)
+
             # Audit fix S4: keep `state.current_rice` in sync with the
-            # rice that was actually restored. If the snapshot does
-            # not record a rice name (older snapshot, or a hand-edited
-            # `.captured.txt` with an invalid name), we report an
-            # explicit error rather than guess.
-            if rice_name:
+            # rice that was actually restored. A snapshot whose
+            # `.captured.txt` has no `rice=` line at all (an older
+            # snapshot) is reported as an error rather than guessed; an
+            # empty-but-present `rice=` means "no rice" and is valid.
+            if rice_name is not None:
                 st = read_state(roots)
                 st.current_rice = rice_name
                 write_state(roots, st)
@@ -452,7 +520,7 @@ def do_rollback(roots: Roots, ts: str | None = None, logger=None, *,
                 "action": "rollback",
                 "snapshot": ts,
                 "restored_count": len(restored),
-                "rice": rice_name or None,
+                "rice": rice_name,
                 "compositor_reload": reloaded,
                 "errors": errors,
             })

@@ -611,6 +611,24 @@ class SnapshotTest(unittest.TestCase):
             "tilde config_link snapshot must contain the live files",
         )
 
+    def test_restore_distinguishes_empty_rice_from_missing_line(self):
+        # Present-but-empty `rice=` means "no rice" (valid); a snapshot
+        # with no `rice=` line at all is untrusted and must yield None.
+        ts, _ = create_pending(self.roots, [self.live_dir], rice_name="")
+        commit_snapshot(self.roots, ts)
+        _, rice = restore_snapshot(self.roots, ts)
+        self.assertEqual(rice, "")
+
+        ts2, _ = create_pending(self.roots, [self.live_dir], rice_name="")
+        commit_snapshot(self.roots, ts2)
+        man = os.path.join(snapshot_dir(self.roots), ts2, ".captured.txt")
+        with open(man) as f:
+            kept = [l for l in f.read().splitlines() if not l.startswith("rice=")]
+        with open(man, "w") as f:
+            f.write("\n".join(kept) + "\n")
+        _, rice2 = restore_snapshot(self.roots, ts2)
+        self.assertIsNone(rice2)
+
 
 class GatherConfigLinksTest(unittest.TestCase):
     def test_expands_user_and_makes_absolute(self):

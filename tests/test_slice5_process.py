@@ -52,7 +52,7 @@ from rice_switcher.manifest import (
 )
 from rice_switcher.paths import Roots, manifest_path, rice_dir
 from rice_switcher.state import State, read_state, write_state
-from rice_switcher.switch import do_switch, resolve_manage_processes
+from rice_switcher.switch import do_rollback, do_switch, resolve_manage_processes
 from rice_switcher.validate import validate_manifest
 
 
@@ -591,6 +591,31 @@ class SwitchProcessTest(unittest.TestCase):
         )
         self.assertEqual(outcome.errors, [])
         self.assertEqual(rt.records, [])   # no command at all
+
+    def test_manual_rollback_reconciles_processes_and_state(self):
+        rt = self._runtime()
+        rt.effects["waybar-stop"] = ("waybar", False)
+        rt.effects["quickshell-start"] = ("quickshell", True)
+        outcome = do_switch(
+            self.roots, "B", [self.a, self.b],
+            dry_run=False, manage_processes=True, runtime=rt,
+        )
+        self.assertEqual(outcome.errors, [])
+        self.assertIn("waybar", rt.up)
+        # Roll back manually: B's waybar must be stopped and A's
+        # quickshell restarted (Bug 4: rollback used to leave the
+        # target rice's processes running).
+        ts, errs = do_rollback(
+            self.roots, outcome.snapshot_ts, None,
+            reload_fn=lambda: None, runtime=rt, all_manifests=[self.a, self.b],
+        )
+        self.assertEqual(errs, [])
+        self.assertTrue(rt.ran("waybar-stop"))
+        self.assertTrue(rt.ran("quickshell-start"))
+        self.assertNotIn("waybar", rt.up)
+        self.assertIn("quickshell", rt.up)
+        # State follows the restored (snapshot) rice.
+        self.assertEqual(read_state(self.roots).current_rice, "A")
 
 
 if __name__ == "__main__":

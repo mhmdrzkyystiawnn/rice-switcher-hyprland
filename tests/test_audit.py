@@ -707,11 +707,18 @@ class RollbackUpdatesStateTest(unittest.TestCase):
             create_pending, commit, pending_path, committed_path,
         )
         from rice_switcher.state import read_state, write_state, State
-        # 1. Create a snapshot without rice_name
+        # 1. Create a snapshot, then strip the `rice=` line entirely so
+        #    it looks like a pre-S4 snapshot (a present-but-empty
+        #    `rice=` is a DIFFERENT, valid case; see the next test).
         ts, _ = create_pending(self.roots, [self.live])  # no rice_name
         commit(self.roots, ts)
+        man = os.path.join(committed_path(self.roots, ts), ".captured.txt")
+        with open(man) as f:
+            kept = [l for l in f.read().splitlines() if not l.startswith("rice=")]
+        with open(man, "w") as f:
+            f.write("\n".join(kept) + "\n")
         # 2. Set state.current_rice to something to prove the rollback
-        #    does NOT change it (since rice_name is empty)
+        #    does NOT change it (since rice_name is missing)
         write_state(self.roots, State(current_rice="prev", last_switch=0.0))
         # 3. Mutate live so rollback can prove it restored
         with open(os.path.join(self.live, "h.txt"), "w") as f:
@@ -731,6 +738,21 @@ class RollbackUpdatesStateTest(unittest.TestCase):
         with open(os.path.join(self.live, "h.txt")) as f:
             self.assertEqual(f.read(), "v0\n",
                 f"file was not restored: {f.read()!r}")
+
+    def test_rollback_present_empty_rice_resets_state(self):
+        # A present-but-empty `rice=` means the pre-switch state had no
+        # rice: rollback must reset current_rice to "" (not error, not
+        # leave the target rice in place).
+        from rice_switcher.snapshot import create_pending, commit
+        from rice_switcher.state import read_state, write_state, State
+        ts, _ = create_pending(self.roots, [self.live], rice_name="")
+        commit(self.roots, ts)
+        write_state(self.roots, State(current_rice="prev", last_switch=0.0))
+        from rice_switcher.switch import do_rollback
+        _, errs = do_rollback(self.roots, ts, None, reload_fn=lambda: None)
+        self.assertEqual(errs, [], f"unexpected errors: {errs}")
+        self.assertEqual(read_state(self.roots).current_rice, "",
+            "empty rice= must reset state.current_rice to ''")
 
 
 if __name__ == "__main__":

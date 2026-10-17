@@ -261,7 +261,7 @@ def prune(roots: Roots, keep: int = 5) -> list[str]:
     return to_remove
 
 
-def restore(roots: Roots, ts: str) -> tuple[list[str], str]:
+def restore(roots: Roots, ts: str) -> tuple[list[str], str | None]:
     """Restore a committed snapshot by copying its contents back over
     the live config_link paths.
 
@@ -269,9 +269,14 @@ def restore(roots: Roots, ts: str) -> tuple[list[str], str]:
     -------
     (restored_paths, rice_name)
         `restored_paths` lists the config_link paths that were
-        restored. `rice_name` is the name recorded by `create_pending`
-        via the `rice=...` line in `.captured.txt`, or the empty
-        string if the snapshot predates that field (audit fix S4).
+        restored. `rice_name` distinguishes three cases:
+
+        * a non-empty name — the rice recorded by `create_pending`;
+        * ``""`` — the ``rice=`` line is present but empty, i.e. the
+          pre-switch state was "no rice" (a legitimate state);
+        * ``None`` — there is no ``rice=`` line at all (a snapshot that
+          predates the field, audit fix S4), so the caller must not
+          guess the rice.
 
     Reads the `.captured.txt` manifest written by `create_pending` to
     know which paths to restore. If the manifest is missing, returns
@@ -281,7 +286,7 @@ def restore(roots: Roots, ts: str) -> tuple[list[str], str]:
     if not os.path.isdir(snap):
         raise FileNotFoundError(f"snapshot not found: {snap}")
     manifest = os.path.join(snap, ".captured.txt")
-    rice_name = ""
+    rice_name: str | None = None
     paths: list[str] = []
     if os.path.isfile(manifest):
         for raw in open(manifest, "r", encoding="utf-8"):
@@ -291,13 +296,17 @@ def restore(roots: Roots, ts: str) -> tuple[list[str], str]:
             if line.startswith("rice="):
                 # Audit fix S4: rice name is recorded for state restoration.
                 candidate = line[len("rice="):]
+                if candidate == "":
+                    # Present but empty: "no rice" before the switch.
+                    rice_name = ""
+                    continue
                 # Validate before trusting it; the snapshot may have
                 # been hand-edited.
                 from .paths import validate_rice_name as _v
                 ok, _err = _v(candidate)
                 if ok:
                     rice_name = candidate
-                # else: leave rice_name="" and let the caller handle
+                # else: leave rice_name=None and let the caller handle
                 # it explicitly.
                 continue
             paths.append(line)

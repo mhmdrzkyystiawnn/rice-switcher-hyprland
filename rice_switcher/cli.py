@@ -521,7 +521,15 @@ def cmd_snapshot(args, roots: Roots, log) -> int:
 # ---------------------------------------------------------------------------
 
 def cmd_rollback(args, roots: Roots, log) -> int:
-    ts, errors = do_rollback(roots, args.ts, log)
+    from .lifecycle import Runtime
+    manifests: list[Manifest] = []
+    for name, path in list_manifests(roots.rice_home):
+        try:
+            manifests.append(load_manifest(path))
+        except Exception as e:
+            print(f"warning: skipping {name} (parse error: {e})", file=sys.stderr)
+    ts, errors = do_rollback(roots, args.ts, log,
+                             runtime=Runtime(), all_manifests=manifests)
     if errors:
         for e in errors:
             print(f"error: {e}", file=sys.stderr)
