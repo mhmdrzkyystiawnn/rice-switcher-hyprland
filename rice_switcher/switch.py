@@ -1,13 +1,16 @@
 """Top-level switch orchestrator.
 
 PLAN.md §3.2 (pseudocode for `rice-switcher switch`). This module glues
-together validate, managed_set, snapshot, lock, and state. Slice 1
-implements the algorithm but **does not** perform real process management
-or real Hyprland reload: see §11.1 for the explicit Slice-1 contract.
+together validate, managed_set, snapshot, lock, state, and the component
+lifecycle (`lifecycle.py`). It performs the full PLAN §3.2 sequence:
+``hooks.pre -> stop -> theme -> swap -> verify -> reload -> matugen ->
+start -> hooks.post``.
 
 The orchestrator respects:
   * `--dry-run` / `RICE_DRY_RUN=1`: print the plan, change nothing.
-  * `RICE_TEST=1`: stub out every external command. Used by tests.
+  * `RICE_TEST=1`: disable lifecycle execution so tests never spawn real
+    commands. Tests that want it inject a fake `Runtime` and pass
+    `manage_processes=True`.
   * Compositor invariant: never stops or starts the compositor.
   * Managed-set invariant: never touches components outside it.
 """
@@ -18,10 +21,22 @@ import os
 import sys
 from dataclasses import dataclass
 
+from .lifecycle import (
+    LifecycleError,
+    Runtime,
+    apply_theme,
+    find_component,
+    hyprland_verify,
+    reload_component,
+    run_hooks,
+    run_wallpaper,
+    start_component,
+    stop_component,
+)
 from .lock import LockError, switch_lock
 from .log import append_audit, setup_logging
 from .managed_set import Identity, SwitchPlan, compute_plan
-from .manifest import Manifest
+from .manifest import Component, Manifest
 from .paths import (
     Roots,
     audit_log_file,
@@ -86,6 +101,18 @@ def _print_plan(plan: SwitchPlan, roots: Roots) -> str:
 # Main entry
 # ---------------------------------------------------------------------------
 
+def resolve_manage_processes(value: bool | None) -> bool:
+    """Decide whether lifecycle steps run.
+
+    Explicit True/False wins. When None (the default), process management
+    is on unless ``RICE_TEST=1`` is set, so the test suite stays hermetic
+    without every test having to pass the flag (PLAN.md §3.5).
+    """
+    if value is not None:
+        return value
+    return os.environ.get("RICE_TEST") != "1"
+
+
 def do_switch(
     roots: Roots,
     target_name: str,
@@ -94,6 +121,8 @@ def do_switch(
     dry_run: bool = True,
     force_real: bool = False,
     logger=None,
+    manage_processes: bool | None = None,
+    runtime: Runtime | None = None,
 ) -> SwitchOutcome:
     """Plan and (optionally) execute a switch.
 
@@ -106,11 +135,15 @@ def do_switch(
     dry_run : if True (default), print the plan and return without
         touching the filesystem. Caller may pass --no-dry-run to
         override; we also honour the RICE_DRY_RUN env var.
-    force_real : when True, real execution is allowed (Slice 1 stub:
-        we still do NOT touch the real desktop; the flag is reserved
-        for future slices). The flag's job is to require an explicit
-        opt-in.
+    force_real : when True, real execution is allowed. The flag's job
+        is to require an explicit opt-in.
     logger : optional logger; if absent, a default one is set up.
+    manage_processes : run the lifecycle steps (hooks, stop, theme,
+        reload, matugen, start). When None (default), it is enabled
+        unless ``RICE_TEST=1`` is set, so the existing test suite stays
+        hermetic. Pass True/False to force it.
+    runtime : the execution environment (see ``lifecycle.Runtime``).
+        Injected by tests; defaults to the real subprocess/proc one.
     """
     if logger is None:
         logger = setup_logging(roots)
@@ -118,6 +151,12 @@ def do_switch(
     # Force dry-run if env var is set.
     if os.environ.get("RICE_DRY_RUN") == "1":
         dry_run = True
+
+    # Lifecycle execution is on by default; RICE_TEST=1 disables it so
+    # tests never spawn real commands unless they inject a runtime.
+    manage_processes = resolve_manage_processes(manage_processes)
+    if runtime is None:
+        runtime = Runtime()
 
     errors: list[str] = []
     warnings: list[str] = []
@@ -181,26 +220,82 @@ def do_switch(
                 roots, config_links, rice_name=rollback_rice_name,
             )
             logger.info("snapshot pending ts=%s captured=%d", ts, len(captured))
+
+            started: list[Component] = []
+            stopped: list[Component] = []
+
+            def _audit(kind: str, name: str, command: str, res) -> None:
+                append_audit(roots, {
+                    "action": "exec",
+                    "kind": kind,
+                    "component": name or None,
+                    "command": command,
+                    "rc": None if res is None else res.rc,
+                    "timed_out": None if res is None else res.timed_out,
+                })
+
             try:
-                # 9. Swap symlinks
+                # Lifecycle (PLAN.md §3.2 #5-#7): pre-hooks, stop old
+                # components, apply theme. All skipped when process
+                # management is off (e.g. RICE_TEST=1).
+                if manage_processes:
+                    run_hooks(runtime, target_m.hooks_pre, phase="pre", audit=_audit)
+                    for ident in plan.to_stop:
+                        c = find_component(ident, all_manifests)
+                        if c is None:
+                            continue
+                        stop_component(runtime, c, audit=_audit)
+                        stopped.append(c)
+                    apply_theme(runtime, target_m.theme, audit=_audit)
+
+                # 9. Swap symlinks (PLAN.md §3.2 #8). This is the only
+                # filesystem change: the live config_link is pointed at
+                # <rice_home>/<name>/<basename(config_link)>.
                 for c in target_m.components:
                     if c.config_link:
                         n = os.path.abspath(os.path.expanduser(c.config_link))
-                        # Real execution: symlink to the rice dir.
-                        # For Slice 1 we still point the symlink at
-                        # the rice dir; this is the only filesystem
-                        # change we make. (See §11.1 for what we do
-                        # NOT do.)
                         rice_dir = os.path.dirname(os.path.dirname(target_m.source_path))
                         new_target = os.path.join(rice_dir, target_name,
                                                   os.path.basename(n))
                         swap_symlink(n, new_target)
+
+                # Lifecycle (PLAN.md §3.2 #9-#12): verify, reload,
+                # matugen, start, post-hooks.
+                if manage_processes:
+                    hypr_swapped = any(
+                        c.name == "hyprland" and c.config_link
+                        for c in target_m.components
+                    )
+                    if hypr_swapped and not hyprland_verify(runtime, audit=_audit):
+                        raise LifecycleError("hyprland --verify-config failed after swap")
+                    reloaded_hypr = False
+                    for ident in plan.to_reload:
+                        c = find_component(ident, all_manifests)
+                        if c is not None:
+                            reload_component(runtime, c, audit=_audit)
+                            if c.name == "hyprland" and c.reload:
+                                reloaded_hypr = True
+                    # Reload Hyprland when its config was swapped and the
+                    # component did not already carry a reload command.
+                    if hypr_swapped and not reloaded_hypr:
+                        hypr = next(c for c in target_m.components if c.name == "hyprland")
+                        reload_cmd = hypr.reload or "hyprctl reload"
+                        res = runtime.run(reload_cmd, timeout=float(hypr.timeout))
+                        _audit("reload", "hyprland", reload_cmd, res)
+                    run_wallpaper(runtime, target_m.wallpaper, audit=_audit)
+                    for ident in plan.to_start:
+                        c = find_component(ident, all_manifests)
+                        if c is None:
+                            continue
+                        start_component(runtime, c, audit=_audit)
+                        started.append(c)
+                    run_hooks(runtime, target_m.hooks_post, phase="post", audit=_audit)
+
                 # 10. Commit the pending snapshot
                 commit_snapshot(roots, ts)
                 # 11. Prune old snapshots (keep 5)
                 prune_snapshots(roots, keep=5)
                 # 12. Update state (current_rice + trust cache)
-                from .state import State as _State
                 st = read_state(roots)
                 st.current_rice = target_name
                 write_state(roots, st)
@@ -220,9 +315,20 @@ def do_switch(
                 })
                 logger.info("switched to %s (snapshot=%s)", target_name, ts)
             except Exception as e:
-                # Rollback: restore from pending snapshot, then discard
-                # the pending. Re-create the symlinks the swap touched.
+                # Rollback: processes first (best-effort, PLAN.md §3.3),
+                # then the filesystem, then discard the pending snapshot.
                 logger.error("switch failed: %s; rolling back", e)
+                if manage_processes:
+                    for c in reversed(started):
+                        try:
+                            stop_component(runtime, c)
+                        except Exception:
+                            pass
+                    for c in reversed(stopped):
+                        try:
+                            start_component(runtime, c, require_running=False)
+                        except Exception:
+                            pass
                 # Restore each config_link from the pending snapshot.
                 from .snapshot import _copy_tree_symlinks
                 for cl in config_links:

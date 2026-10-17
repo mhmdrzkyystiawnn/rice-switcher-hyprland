@@ -4,32 +4,26 @@ PLAN §2d, line 378: "restore rice terakhir dari `state.json` (start
 komponen yang harus aktif sesuai managed set)".
 
 This is invoked from `hyprland/execs.lua` inside `hl.on("hyprland.start", ...)`
-during a Hyprland session start. Slice 3's `apply` is intentionally
-limited to:
+during a Hyprland session start. `apply`:
 
-- read `state.current_rice` from state.json
+- reads `state.current_rice` from state.json
 - if empty, exit 0 (first boot, nothing to do)
-- validate the target rice is still installed
-- acquire the switch lock
-- run the same orchestrator (`do_switch`) used by `cmd_switch`,
+- validates the target rice is still installed
+- acquires the switch lock
+- runs the same orchestrator (`do_switch`) used by `cmd_switch`,
   but skipping the user confirmation prompt (apply is automatic)
-- emit a single audit event
+- emits a single audit event
 
-Slice 3 does NOT:
-- start/stop processes (managed set components). The startup of
-  waybar/quickshell/etc. is the responsibility of the existing
-  `hl.exec_cmd` lines in `hyprland/execs.lua`; this module is a
-  pure orchestrator for the symlink swap, mirroring the Slice 1
-  `do_switch` algorithm.
-- reload Hyprland or signal any desktop process.
-- touch the live desktop, the live config, the live state file, or
-  any process.
+Since `do_switch` now performs the full lifecycle (hooks, stop, theme,
+reload, matugen, start — see `switch.py` and `lifecycle.py`), `apply`
+inherits that behaviour: on session start it can restore the last rice's
+components. As with `switch`, set `RICE_TEST=1` (or pass
+`manage_processes=False`) to keep it to the symlink swap only.
 
 Slice 3 lifecycle migration (removing the individual `hl.exec_cmd`
 lines and replacing them with `hl.on("hyprland.start", ...) → apply`)
-is out of scope for this slice per PLAN §2d. The `apply` function is
-a building block that the user can wire up manually once they are
-ready.
+is still the user's call per PLAN §2d; `apply` is a building block they
+wire up when ready.
 """
 
 from __future__ import annotations

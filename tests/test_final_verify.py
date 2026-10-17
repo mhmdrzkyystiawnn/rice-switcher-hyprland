@@ -10,6 +10,13 @@ All tests use temporary directories; no live config is touched.
 
 from __future__ import annotations
 
+import os as _os
+
+# Process management (Slice 5) is exercised in tests/test_slice5_process.py
+# with an injected fake runtime. Everywhere else it is disabled so the suite
+# never spawns real commands or touches the desktop (PLAN.md §3.5).
+_os.environ.setdefault("RICE_TEST", "1")
+
 import io
 import json
 import os

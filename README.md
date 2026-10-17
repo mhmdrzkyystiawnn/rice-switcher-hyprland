@@ -1,16 +1,16 @@
 # rice-switcher-hyprland
 
-> Switch between Hyprland "rices" by swapping config symlinks — safely, with snapshots, rollback, and a dry-run-by-default workflow.
+> Switch between Hyprland "rices" by swapping config symlinks and restarting the desktop components — safely, with snapshots, rollback, and a dry-run-by-default workflow.
 
-![status](https://img.shields.io/badge/status-slices%201--4%20implemented-blue)
+![status](https://img.shields.io/badge/status-slices%201--5%20implemented-blue)
 ![python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
 Hyprland has no built-in way to swap between whole desktop setups. If you keep several rices (for example a Quickshell-based one and a minimal Waybar one), switching by hand means swapping a pile of config directories and hoping nothing breaks.
 
-**rice-switcher** records each rice in a `rice.toml` manifest and swaps the `config_link` symlinks for you, with a snapshot taken before every change so you can roll back.
+**rice-switcher** records each rice in a `rice.toml` manifest, then swaps the `config_link` symlinks and runs the component lifecycle (hooks, stop/start, `[theme]`, Hyprland reload) for you, with a snapshot taken before every change so you can roll back.
 
-> **Project status:** the CLI implements Slices 1–4 (see [Roadmap](#roadmap)). Everything documented below describes what the code does *today*. Features that are designed but **not** implemented are collected in [Not yet implemented](#not-yet-implemented); do not assume they exist.
+> **Project status:** the CLI implements Slices 1–5 (see [Roadmap](#roadmap)). Everything documented below describes what the code does *today*. Features that are designed but **not** implemented are collected in [Not yet implemented](#not-yet-implemented); do not assume they exist.
 
 ---
 
@@ -42,7 +42,8 @@ Hyprland has no built-in way to swap between whole desktop setups. If you keep s
 - **Snapshots & rollback:** the live `config_link` targets of the current rice are snapshotted before a swap. `rollback` restores them and re-syncs `state.json`.
 - **Dry-run by default:** `switch` and `import` change nothing unless you pass `--no-dry-run` / `--apply`.
 - **Pre-flight validation:** `switch` validates the target manifest first (schema, `config_link` conflicts and escape checks, missing `start`). Errors abort the switch; warnings are printed. `validate` runs a deeper check (binaries, Hyprland config, matugen templates).
-- **Identity-aware process probing:** process identity is `(executable, argv_match)`, so `qs -c ii` and `qs -c minimal` are distinguished. Used by `status` to report running PIDs; see [Not yet implemented](#not-yet-implemented) for what this does *not* do yet.
+- **Process lifecycle:** `switch` runs hooks, stops/starts the managed components (verified by identity-aware probing), applies `[theme]`, reloads Hyprland, and regenerates colors with matugen (PLAN.md §3.2). `RICE_TEST=1` keeps it to the symlink swap.
+- **Identity-aware process probing:** process identity is `(executable, argv_match)`, so `qs -c ii` and `qs -c minimal` are distinguished. Used by `status` to report running PIDs and by the lifecycle to decide whether a component is up.
 - **Lock file:** an `flock`-based lock with a 5-second timeout prevents concurrent switches.
 - **Audit log:** every real action appends one JSON Lines event, with sensitive values redacted.
 - **Zero dependencies:** Python 3.11+ standard library only.
@@ -64,30 +65,32 @@ Hyprland has no built-in way to swap between whole desktop setups. If you keep s
 ### What `switch` does today
 
 1. **Locate** the target rice; abort if unknown.
-2. **Validate** the target manifest (`validate_manifest`). `config_link` conflicts / escape and a missing `start` for a non-optional component are errors; missing binaries and other issues are warnings.
+2. **Validate** the target manifest (`validate_manifest`). `config_link` conflicts / escape, a missing `start` for a non-optional component, and a `pkill -f`/`--full` command anywhere are errors; missing binaries and other issues are warnings.
 3. **No-op check** — if the target is already the current rice, print a no-op plan and stop.
 4. **Compute the plan** — `to_stop`, `to_start`, `to_reload`, `to_swap`, `to_keep` — from the managed set and the current symlink state.
 5. **Dry-run** (the default) prints the plan and returns without touching anything.
 6. **Acquire the lock** (5-second timeout).
 7. **Snapshot** the current rice's `config_link` targets into `snapshot/.pending-<ts>/` (recording the current rice name in `.captured.txt`).
-8. **Swap each `config_link`** to the target rice's copy; the previous entry is renamed to `<path>.bak-<ts>`.
-9. **Commit** the pending snapshot, then prune old snapshots (keep 5).
-10. **Update `state.json`** (`current_rice` + trust cache) and append an audit event.
-11. If anything fails after step 7, the `config_link`s are restored from the pending snapshot, the pending snapshot is discarded, the trust entry is marked `rolled_back`, and the error is returned.
+8. **Run `[hooks] pre`** (each through `bash -lc`).
+9. **Stop** the components in `to_stop` (their `stop` command, then wait for them to disappear; `stop_check` or a `/proc` scan).
+10. **Apply `[theme]`** — cursor via `hyprctl setcursor`, GTK/icon/fonts via `gsettings`, then the optional `theme.apply`.
+11. **Swap each `config_link`** to the target rice's copy; the previous entry is renamed to `<path>.bak-<ts>`.
+12. **Verify** the new Hyprland config (`hyprland --verify-config`), **reload** (`hyprctl reload` plus every command in `to_reload`), and **regenerate colors** (`matugen image <wallpaper>`).
+13. **Start** the components in `to_start` (their `start` command, wait for them to come up, then `health_check` if set).
+14. **Run `[hooks] post`**.
+15. **Commit** the pending snapshot, then prune old snapshots (keep 5).
+16. **Update `state.json`** (`current_rice` + trust cache) and append an audit event per executed command.
+17. If anything fails after step 7, the lifecycle is unwound best-effort (started components stopped, stopped components restarted) and the `config_link`s are restored from the pending snapshot; the pending snapshot is discarded, the trust entry is marked `rolled_back`, and the error is returned.
 
-The compositor (`type = "compositor"`) is never stopped or started — `switch` never sends signals to any process.
+The compositor (`type = "compositor"`) is never stopped or started. Steps 8–14 execute real commands and are **on by default**; set `RICE_TEST=1` (or `--dry-run`) to skip them.
 
 ### What `switch` does **not** do
 
-`switch` only swaps symlinks, snapshots, and updates state. It does **not** (yet):
+- **Undo irreversible steps.** `[hooks]`, `theme.apply` and matugen cannot be undone; rollback restores files/symlinks and best-effort restarts processes, but does not reverse those.
+- **Guarantee every stopped process returns.** A component whose `start` is broken will not come back; check the audit log.
+- **Touch components outside the managed set** (`gnome-keyring`, `geoclue`, `ydotool`, `cliphist_*`, …) — those are never managed.
 
-- **start or stop components.** `to_stop` / `to_start` are computed and printed, but no process is signalled. Autostart remains the job of the `hl.exec_cmd` lines in your `hyprland/execs.lua`.
-- **apply `[theme]`** (cursor / GTK / icon).
-- **run `[hooks]`** pre/post.
-- **run matugen** or regenerate colors.
-- **reload Hyprland** (`hyprctl reload`).
-
-See [Not yet implemented](#not-yet-implemented).
+See [Not yet implemented](#not-yet-implemented) for the rest of the roadmap.
 
 ---
 
@@ -99,12 +102,15 @@ See [Not yet implemented](#not-yet-implemented).
 
 **Used only by specific commands**
 
-- `hyprctl` — needed by `apply --require-session` to probe for a live Hyprland session.
-- `hyprland` — needed by `validate` to run `hyprland --verify-config --config <path>`.
+- `hyprctl` — needed by `apply --require-session` to probe for a live Hyprland session, and by `switch` to apply the cursor (`hyprctl setcursor`) and reload Hyprland.
+- `hyprland` — needed by `validate` and by `switch` to run `hyprland --verify-config`.
+- `gsettings` — needed by `switch` to apply `[theme]` GTK/icon/font values.
+- `matugen` — needed by `switch` to regenerate colors when the target rice sets `wallpaper`.
+- `bash` — needed by `switch` to run `[hooks]`, `theme.apply` and any `start`/`stop` command that uses shell syntax.
 - An editor (`$EDITOR` / `$VISUAL` / `vi`) — needed by `edit`.
 - `fuzzel` or `rofi` — needed by `menu` (either one).
 
-Nothing else is executed by the tool. Binaries named in a component's `start` are only *looked up on `PATH`* by validation (a warning if missing) — they are not run.
+Binaries named in a component's `start` are looked up on `PATH` by validation (a warning if missing) and, on `switch`, actually executed for the components in the plan.
 
 ---
 
@@ -198,7 +204,7 @@ author = "your-name"
 config_dir = "./"                    # relative to rice.toml
 wallpaper = "./wallpapers/default.png"
 
-[theme]                              # parsed, but NOT applied yet
+[theme]                              # applied by `switch` (cursor/gsettings/apply)
 cursor_name = "Bibata-Modern-Classic"
 cursor_size = 24
 gtk_theme = "Wallbash-Gtk"
@@ -207,7 +213,7 @@ font_main = "Google Sans Flex"
 font_mono = "JetBrains Mono Nerd Font"
 # apply = "~/rice/illogical-impulse/scripts/apply-theme.sh"   # optional custom command
 
-[hooks]                              # parsed, but NOT run yet
+[hooks]                              # run by `switch` pre/post (via `bash -lc`)
 pre = []
 post = []
 
@@ -247,7 +253,7 @@ stop = "pkill -x easyeffects"
 optional = true                      # skipped by validation if `start` has no binary on PATH
 ```
 
-`pkill -f` / `pkill --full` is considered dangerous because it matches the full command line (including the switcher itself). A helper (`looks_like_dangerous_pkill`) exists for this and is unit-tested, but it is **not yet wired into manifest validation**, so such patterns are not rejected today.
+`pkill -f` / `pkill --full` is considered dangerous because it matches the full command line (including the switcher itself). `validate_manifest` rejects it (an **error**) in any `start` / `stop` / `reload` / `start_check` / `stop_check` / `health_check`, in `[hooks]`, and in `theme.apply`. Use `pkill -x` (exact process name) instead.
 
 ### Component fields
 
@@ -259,18 +265,18 @@ optional = true                      # skipped by validation if `start` has no b
 | `stop` | no | Command to stop the component. Defaults to `true`. |
 | `executable` | no | Executable basename for process identity (defaults to `name`). |
 | `argv_match` | no | Tokens that must appear in the process argv, to tell apart e.g. `qs -c ii` from `qs -c minimal`. |
-| `reload` | no | Live-reload command (recorded in the manifest; not executed yet). |
+| `reload` | no | Live-reload command, run by `switch` when the component's config changed. |
 | `config_link` | no | Path symlinked to the rice's copy. Only components that set it are swapped. |
 | `depends_on` | no | Components that must start first (recording only). |
-| `start_check` / `stop_check` | no | Verify a process is up / down. Defaults to a `/proc` identity scan. |
-| `health_check` | no | Command that exits 0 when healthy (recording only). |
-| `optional` | no | Exempt from the "missing binary" and "missing start" checks. |
-| `timeout` | no | Non-negative integer (default 10; recording only). |
+| `start_check` / `stop_check` | no | Command that exits 0 to confirm up / down. Defaults to a `/proc` identity scan. |
+| `health_check` | no | Command that must exit 0 after `start`; a failure aborts the switch. |
+| `optional` | no | Exempt from the "missing binary" and "missing start" checks; a failed `stop`/`start` is skipped instead of aborting. |
+| `timeout` | no | Non-negative integer (default 10) — per-command timeout and how long to wait for the process to appear/disappear. |
 | `match` | no | Free-form match string (recording only). |
 
 ### `[theme]` fields
 
-`cursor_name`, `cursor_size`, `gtk_theme`, `icon_theme`, `font_main`, `font_mono`, `font_size`, `apply`. All optional. They are parsed and stored on the manifest, **but `switch` does not apply them yet**.
+`cursor_name`, `cursor_size`, `gtk_theme`, `icon_theme`, `font_main`, `font_mono`, `font_size`, `apply`. All optional. `switch` applies them: cursor via `hyprctl setcursor`, GTK/icon/fonts via `gsettings`, then `apply` (a shell command) last. `apply` failing aborts the switch; the individual `gsettings`/`hyprctl` calls are best-effort.
 
 ### Rules for `config_link`
 
@@ -329,9 +335,9 @@ Runtime state lives in `<RICE_STATE_HOME>/rice-switcher/`: `state.json`, `switch
 
 **Snapshots.** Before any swap, every `config_link` target of the *current* rice is copied into `snapshot/.pending-<ts>/` (symlinks preserved as symlinks, dangling links included; `shutil.copytree(symlinks=True)`, never dereferenced). On success it is renamed to `snapshot/<ts>/` and `snapshot/latest` is updated. The 5 most recent snapshots are kept. Each snapshot stores a `.captured.txt` listing the captured paths and the rice name.
 
-**Rollback.** `switch` rolls back automatically if a step fails after the snapshot is taken: the `config_link`s are restored from the pending snapshot, the pending snapshot is discarded, and `state.json` marks the rice `rolled_back`. `rice-switcher rollback [ts]` restores a committed snapshot manually and re-syncs `current_rice` to the rice recorded in the snapshot. Rollback restores **files and symlinks only** — it does not restart processes.
+**Rollback.** `switch` rolls back automatically if a step fails after the snapshot is taken: started components are stopped and stopped components are restarted (best-effort), the `config_link`s are restored from the pending snapshot, the pending snapshot is discarded, and `state.json` marks the rice `rolled_back`. `rice-switcher rollback [ts]` restores a committed snapshot manually and re-syncs `current_rice` to the rice recorded in the snapshot. Rollback restores **files, symlinks and (best-effort) processes**; it cannot undo `[hooks]`, `theme.apply` or a matugen run.
 
-**Hyprland config validation.** Only the `validate` command runs `hyprland --verify-config --config <path>` (a non-zero result or timeout is an error; a missing `hyprland` binary is a warning). `switch` itself only does a basic `require("...")` / `source = ...` referenced-path check on `hyprland.lua` (warnings, not errors). `--verify-config` checks syntax only.
+**Hyprland config validation.** The `validate` command runs `hyprland --verify-config --config <path>` (a non-zero result or timeout is an error; a missing `hyprland` binary is a warning). `switch` validates the manifest too (including the basic `require("...")` / `source = ...` referenced-path check on `hyprland.lua`, warnings only) and, after swapping a `hyprland` `config_link`, runs `hyprland --verify-config` again; a failure there triggers the rollback. `--verify-config` checks syntax only.
 
 **Locking.** `flock(2)` on `switch.lock` with a 5-second timeout. A second switch while one is running aborts without changing anything.
 
@@ -339,14 +345,14 @@ Runtime state lives in `<RICE_STATE_HOME>/rice-switcher/`: `state.json`, `switch
 
 ## Security
 
-A `rice.toml` may one day run shell commands on your machine. Today the tool **does not execute** `start`, `stop`, `reload`, `hooks.*` or `theme.apply` — it only validates them and probes process identity. Treat that as a limitation, not a guarantee, and still treat rices from other people like any script you download.
+A `rice.toml` can run shell commands on your machine. `switch` (and `apply`) execute `start`, `stop`, `reload`, `hooks.*` and `theme.apply` — treat a rice from someone else like any script you download and review it before switching.
 
 - `import` is read-only: it parses the manifest and copies files, and never executes anything from the source manifest.
 - The first `switch` to a rice prints the plan and requires typing `yes` (unless the rice is already trusted and its manifest hash is unchanged).
 - Approval is tied to the manifest's SHA-256. If the manifest changes, you are asked again.
-- The tool's own subprocess calls (editor, picker, `hyprland --verify-config`) use argv lists, never `eval`. A `looks_like_dangerous_pkill` helper flags `pkill -f` / `pkill --full` (too broad, and it matches the switcher itself), but it is not yet called by validation.
+- The tool's own subprocess calls (editor, picker, `hyprland --verify-config`, component lifecycle) use argv lists, never `eval`. Validation rejects `pkill -f` / `pkill --full` (too broad, and it matches the switcher itself) in any lifecycle command, hook, or `theme.apply`.
 - Actions are recorded in a JSON Lines audit log (`logs/audit.log`). Sensitive keys (`api_key`, `token`, `secret`, …) and secret-shaped values are redacted before writing. There is no auto-delete; old `audit-*.log` archives are gzipped once older than `RICE_AUDIT_ROTATE_DAYS` (default 30).
-- Because commands are not executed yet, the audit log records *what the tool did* (switch, rollback, import, edit, keybind-install, …), not command exit codes.
+- Each executed lifecycle command is recorded in the audit log with its exit code (`action: "exec"`), alongside the higher-level events (switch, rollback, import, edit, keybind-install, …).
 
 **Before publishing your own rices**, check for personal data: `grep -r "/home/<you>" rice/`, redact private model/endpoint descriptions in app configs, and never commit browser profiles, keyrings, SSH/GPG keys or `.env` files. The shipped `.gitignore` already excludes `*.env`, `id_*`, `.ssh/` and `.gnupg/`.
 
@@ -362,7 +368,7 @@ A `rice.toml` may one day run shell commands on your machine. Today the tool **d
 | `RICE_LOG_FILE` | Custom text log path (default `<RICE_STATE_HOME>/rice-switcher/logs/switcher.log`). |
 | `RICE_DRY_RUN=1` | Force dry-run on the switch path (`switch`, `apply`, `menu`). |
 | `RICE_AUDIT_ROTATE_DAYS` | Gzip audit archives older than this many days (default `30`). |
-| `RICE_TEST=1` | **Not implemented** — see [Not yet implemented](#not-yet-implemented). |
+| `RICE_TEST=1` | Disable lifecycle execution (hooks/stop/theme/reload/matugen/start) so only the symlink swap runs. Used by the test suite. |
 
 The same path overrides can be set per rice in the `[run]` table of `rice.toml` (`rice_home`, `config_home`, `state_home`).
 
@@ -370,7 +376,7 @@ The same path overrides can be set per rice in the `[run]` table of `rice.toml` 
 
 ## Matugen and generated files
 
-The tool does **not** run matugen. It only *validates* a rice's matugen config (TOML well-formedness and template `input_path` / `output_path` checks) during `rice-switcher validate`.
+`rice-switcher validate` only *validates* a rice's matugen config (TOML well-formedness and template `input_path` / `output_path` checks). During `switch`, if the target rice sets `wallpaper`, the tool runs `matugen image <wallpaper>` to regenerate colors (a failure is logged, not fatal).
 
 If you run matugen yourself (or via your shell), its output can land inside your rice directories through the symlinked config paths. Add those generated files to `.gitignore` so they are not committed:
 
@@ -389,7 +395,7 @@ If you run matugen yourself (or via your shell), its output can land inside your
 
 ## Testing
 
-The suite uses `unittest` and runs hermetically (everything under temporary directories; it does not start or stop processes, reload Hyprland, or write to `~/.config`).
+The suite uses `unittest` and runs hermetically (everything under temporary directories; it does not start or stop processes, reload Hyprland, or write to `~/.config`). Process-management tests inject a fake `Runtime`; the rest of the suite sets `RICE_TEST=1` so no real command is spawned.
 
 ```bash
 # one file
@@ -401,7 +407,7 @@ for f in tests/test_*.py tests/design/test_*.py; do python3 "$f"; done
 
 Note: `python3 -m unittest discover -s tests` does **not** work because `tests/` is not an importable package (no `__init__.py`); use one of the commands above.
 
-The suite covers managed-set computation, `config_link` conflict detection, process identity, the switch plan (including "compositor never stopped" and "shared component not restarted"), dry-run purity, snapshot and rollback with symlinks, locking, the JSON Lines audit log, and the Slice 2–4 commands (`validate`, `status`, `apply`, `menu`, `keybind-install`, `import`, `diff`, `edit`), plus a dedicated design test file.
+The suite covers managed-set computation, `config_link` conflict detection, process identity, the switch plan (including "compositor never stopped" and "shared component not restarted"), dry-run purity, snapshot and rollback with symlinks, locking, the JSON Lines audit log, the Slice 2–4 commands (`validate`, `status`, `apply`, `menu`, `keybind-install`, `import`, `diff`, `edit`), Slice 5 process management (`executor`, `lifecycle`, hooks/stop/theme/reload/start, process rollback), and a dedicated design test file.
 
 ---
 
@@ -409,14 +415,8 @@ The suite covers managed-set computation, `config_link` conflict detection, proc
 
 These are designed in `PLAN.md` but not implemented in the code:
 
-- **Start/stop of components.** `switch` computes a `to_stop` / `to_start` plan but never signals a process.
-- **Applying `[theme]`** (cursor / GTK / icon / fonts).
-- **Running `[hooks]`** pre/post.
-- **Running matugen** to regenerate colors.
-- **Reloading Hyprland** (`hyprctl reload` / `hyprctl configerrors`).
-- **Automatic rollback of processes** (only files/symlinks are rolled back).
 - **`random`** and **`remove`** subcommands.
-- **Hermetic test mode** (`RICE_TEST=1`): no code reads this variable; tests use their own temporary roots instead.
+- **systemd integration** for managed components (PLAN.md §5.2 chose direct subprocess instead).
 
 ---
 
@@ -427,7 +427,8 @@ These are designed in `PLAN.md` but not implemented in the code:
 | **1. Core** | `init`, `add`, `list`, `current`, `status`, `switch` (+ `--dry-run`), `snapshot`, `rollback`; validation; managed set; locking | Implemented |
 | **2. UX** | `validate`, richer `status`, audit log + rotation, `keybind-install` | Implemented |
 | **3. Automation** | `menu`, `apply` | Implemented |
-| **3. Automation (rest)** | `random`, autostart migration, notifications, real process start/stop | Not implemented |
+| **3. Automation (rest)** | `random`, autostart migration, notifications | Not implemented |
+| **5. Lifecycle** | hooks, stop/start (identity-aware), `[theme]`, `hyprctl reload`, matugen, process rollback | Implemented |
 | **4. Sharing** | `import`, `diff`, `edit` | Implemented |
 | **4. Sharing (rest)** | `remove`, optional systemd integration | Not implemented |
 
@@ -447,8 +448,8 @@ Do **not** call it from a top-level `exec`. Top-level `exec` re-runs on every `h
 
 ## Known limitations
 
-- **Config swap only.** The tool currently swaps symlinks and snapshots; it does not manage processes, themes, hooks, or colors. See [Not yet implemented](#not-yet-implemented).
-- **Not fully transactional.** Rollback restores files and symlinks but cannot undo hook side effects or reverse a matugen run (the tool performs neither yet).
+- **Processes are managed best-effort.** `switch` starts/stops the managed components and reloads Hyprland, but a broken `start` cannot resurrect a component, and two identical processes (`qs -c ii`) cannot be told apart.
+- **Not fully transactional.** Rollback restores files, symlinks and (best-effort) processes, but cannot undo hook side effects or reverse a matugen run.
 - **Hyprland validation is syntax-only.** `--verify-config` can't see missing files referenced from your config; a basic `require(...)` check is added on top.
 - **Duplicate processes.** If two identical `qs -c ii` instances run at once, the tool can't tell which one it should stop.
 - **Missing `hyprlock` helpers.** Rices that enable `hyprlock` must ship the helper scripts referenced by `hyprlock.conf`; validation only warns if they are missing.

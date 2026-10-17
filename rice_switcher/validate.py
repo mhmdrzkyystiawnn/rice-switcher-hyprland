@@ -18,6 +18,7 @@ from typing import Iterable
 
 from .manifest import Component, Manifest
 from .paths import Roots, manifest_path, rice_dir
+from .process import looks_like_dangerous_pkill
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +298,34 @@ def validate_manifest(
                 f"component {c.name!r}: executable should be a basename, "
                 f"got {c.executable!r}"
             )
+        # PLAN.md §2g: `pkill -f`/`--full` matches the whole command line,
+        # including the switcher's own argv. Refuse it in any lifecycle
+        # command so a manifest cannot kill the thing running it.
+        for field_name in ("start", "stop", "reload", "start_check",
+                           "stop_check", "health_check"):
+            value = getattr(c, field_name)
+            if value and looks_like_dangerous_pkill(value):
+                res.errors.append(
+                    f"component {c.name!r}: {field_name}={value!r} uses "
+                    f"`pkill -f`/`--full`, which can match the switcher itself; "
+                    f"use `pkill -x`"
+                )
+
+    # PLAN.md §2g/§2h: hooks and theme.apply run arbitrary shell; refuse
+    # the same dangerous pattern there.
+    for phase, hooks in (("hooks.pre", manifest.hooks_pre),
+                         ("hooks.post", manifest.hooks_post)):
+        for h in hooks:
+            if h and looks_like_dangerous_pkill(h):
+                res.errors.append(
+                    f"{phase}: {h!r} uses `pkill -f`/`--full`, which can match "
+                    f"the switcher itself; use `pkill -x`"
+                )
+    if manifest.theme.apply and looks_like_dangerous_pkill(manifest.theme.apply):
+        res.errors.append(
+            "[theme].apply uses `pkill -f`/`--full`, which can match the "
+            "switcher itself; use `pkill -x`"
+        )
 
     # --- Section: config_link conflicts (§2f) ---
     res.warnings.extend(_config_link_redundant_sublings(manifest.components))
