@@ -1,12 +1,13 @@
 # Design — Onboarding TUI: clone, auto-manifest, gap detection
 
-**Status:** draft **revisi #3** — Prasyarat 0 (kill-by-identity), **Fase 1 (clone + naming)**, dan **Fase 2 (detect + tomlwrite + `generate`) + penyempurnaan 2b** (deteksi berbasis reachability, identitas tanpa argumen) sudah diimplementasikan & diuji; Fase 3–6 belum.
-**Status implementasi:** ✅ Prasyarat 0 (§12) — `process.py`/`lifecycle.py`/`managed_set.py`, identitas tanpa argumen (`exact_argv`, Fase 2b) — `tests/test_slice0_exact_identity.py`; ✅ Fase 1 clone + naming (§3, §9, §10) — `rice_switcher/clone.py`, subcommand `clone`, `tests/test_clone.py`; ✅ Fase 2 deteksi & draft manifest (§4) — `rice_switcher/detect.py`, `rice_switcher/tomlwrite.py`, subcommand `generate`, `tests/test_detect.py`, `tests/test_detect_reachability.py`, `tests/test_tomlwrite.py`, `tests/test_generate.py`; ✅ integrasi end-to-end `clone → generate → validate → switch` — `tests/test_e2e_onboarding.py`; ✅ peringatan `validate` untuk `stop` no-op — `tests/test_slice2b_stop_noop.py`; ⬜ Fase 3–6.
+**Status:** draft **revisi #4** — Prasyarat 0 (kill-by-identity), **Fase 1 (clone + naming)**, **Fase 2 (detect + tomlwrite + `generate`) + penyempurnaan 2b**, dan **Fase 3a (review/edit via prompt baris-per-baris + simpan non-interaktif)** sudah diimplementasikan & diuji; Fase 3b–6 belum.
+**Status implementasi:** ✅ Prasyarat 0 (§12) — `process.py`/`lifecycle.py`/`managed_set.py`, identitas tanpa argumen (`exact_argv`, Fase 2b) — `tests/test_slice0_exact_identity.py`; ✅ Fase 1 clone + naming (§3, §9, §10) — `rice_switcher/clone.py`, subcommand `clone`, `tests/test_clone.py`; ✅ Fase 2 deteksi & draft manifest (§4) — `rice_switcher/detect.py`, `rice_switcher/tomlwrite.py`, subcommand `generate`, `tests/test_detect.py`, `tests/test_detect_reachability.py`, `tests/test_tomlwrite.py`, `tests/test_generate.py`; ✅ integrasi end-to-end `clone → generate → validate → switch` — `tests/test_e2e_onboarding.py`; ✅ peringatan `validate` untuk `stop` no-op — `tests/test_slice2b_stop_noop.py`; ✅ Fase 3a review/edit & simpan tanpa curses (§5) — `rice_switcher/review.py`, `rice_switcher/review_cli.py`, `generate --no-tui/--yes`, `tests/test_slice3a_review.py`, `tests/test_slice3a_review_cli.py`, `tests/test_slice3a_generate_review.py`, `tests/test_slice3a_client_cmd.py`; ⬜ Fase 3b–6.
 **Cakupan:** alur "clone rice orang lain → bisa di-`switch`" menjadi semi-otomatis lewat TUI.
 **Dokumen terkait:** `docs/PLAN.md` (spec inti switch; §2c managed set, §2f `config_link`, §2g identitas proses, §2h keamanan, §4.1 skema manifest, §5.1 zero-dep, §6 roadmap), `README.md`.
 **Sifat:** dokumen desain. Tidak mengubah `docs/PLAN.md`; mekanisme inti switch tetap apa adanya — **kecuali** Prasyarat 0 (kill-by-identity, §12) yang menyentuh `process.py`/`lifecycle.py`.
 
 **Riwayat revisi**
+- **revisi #4** — Fase 3a selesai: model review murni (`rice_switcher/review.py`) + driver prompt baris-per-baris (`rice_switcher/review_cli.py`) + jalur simpan non-interaktif `generate --no-tui/--yes` (§5). Perintah klien sekali-jalan (`swww restore`, `swww img …`) ditandai `ask`, bukan `auto` (§4.1, Langkah 0). `ManifestDraft` membawa `findings` (kosong; Fase 4 mengisi).
 - **revisi #3** — penyempurnaan Fase 2b pasca-implementasi: (1) deteksi berbasis **reachability** dari entrypoint (§4.1), (2) pemecahan **perintah gabungan** + pelewatan wrapper, (3) tabel executable diperluas (`awww`/`swww-daemon`, `pypr`, `mpvpaper`, dst.), (4) **identitas tanpa argumen** `exact_argv` untuk daemon (§4.2), (5) peringatan `validate` untuk `stop` no-op, (6) koreksi dokumen §4.3/§4.5/§4.6 agar cocok dengan implementasi & tes.
 - **revisi #2** — menutup review keamanan & desain: (1) hardening argument injection saat clone, (2) larangan nama berawalan titik, (3) aturan containment symlink, (4) provenance di file terpisah + URL di-redact, (5) temuan baru **autostart bentrok**, (6) cleanup `.bak-*` via `lstat`+`unlink` (bukan `rmtree`), (7) tampilkan isi skrip sebelum approve. Plus **keputusan 7 pertanyaan terbuka** (§14) dan **Prasyarat 0: kill-by-identity** di core (§12). Urutan dibalik: fallback prompt dulu, `curses` terakhir (§5.1).
 - revisi #1 — draft awal.
@@ -165,7 +166,7 @@ Inti fitur. Menghasilkan `ManifestDraft` (bukan final). Sumber inferensi utama =
 
 Contoh pola (teruji di `tests/test_detect.py`): `hl.exec_cmd("qs -c $qsConfig")` + `hl.env("qsConfig","ii")` ⇒ komponen quickshell `qs -c ii`. Parser harus mengikuti indireksi variabel ini (variabel hanya diambil dari berkas yang terjangkau — lihat di bawah).
 
-**Reachability (Fase 2b).** Hanya autostart dari berkas yang benar-benar **terjangkau** dari entrypoint (`hyprland.lua`/`.conf`) yang menjadi komponen. Detector mengikuti `source =` (hyprlang) dan `require(...)`/`dofile(...)` literal (Lua) selama `realpath` tetap di dalam folder rice (containment), dengan penjaga siklus + batas kedalaman (`MAX_SOURCE_DEPTH`). Direktori `archive`/`old`/`backup`/`bak`/`examples`/`example` dan profil tak aktif tidak pernah dianggap hidup; ref-nya tetap dicatat dengan `reachable=False` (untuk Fase 4). Bila tidak ada entrypoint yang terbaca, detector **tidak** mundur ke "pindai semua" — dilaporkan sebagai catatan "tidak ada entrypoint". Perintah gabungan (`&&`, `;`, `||`, `|`, `&`) dipecah (menghormati quote) dan wrapper (`sleep N`, `env VAR=...`, `exec`, `setsid`, `nohup`, `uwsm app --`, `systemd-run --user`) dilewati sebelum mengambil executable. Tabel executable: `qs`/`quickshell`, `waybar`, `hypridle`, `dunst`, `mako`, `swaync`/`swaync-client`, `hyprpaper`, `swww`/`swww-daemon`, `awww`/`awww-daemon`, `mpvpaper`, `hyprlock`, `hyprsunset`, `hyprpolkitagent`, `pypr`, `fcitx5`. Deteksi ini memakai mekanisme identitas Fase 2b: perintah tanpa argumen ⇒ komponen dengan `exact_argv = true` (bisa dihentikan), perintah dengan argumen literal ⇒ `argv_match` (subset).
+**Reachability (Fase 2b).** Hanya autostart dari berkas yang benar-benar **terjangkau** dari entrypoint (`hyprland.lua`/`.conf`) yang menjadi komponen. Detector mengikuti `source =` (hyprlang) dan `require(...)`/`dofile(...)` literal (Lua) selama `realpath` tetap di dalam folder rice (containment), dengan penjaga siklus + batas kedalaman (`MAX_SOURCE_DEPTH`). Direktori `archive`/`old`/`backup`/`bak`/`examples`/`example` dan profil tak aktif tidak pernah dianggap hidup; ref-nya tetap dicatat dengan `reachable=False` (untuk Fase 4). Bila tidak ada entrypoint yang terbaca, detector **tidak** mundur ke "pindai semua" — dilaporkan sebagai catatan "tidak ada entrypoint". Perintah gabungan (`&&`, `;`, `||`, `|`, `&`) dipecah (menghormati quote) dan wrapper (`sleep N`, `env VAR=...`, `exec`, `setsid`, `nohup`, `uwsm app --`, `systemd-run --user`) dilewati sebelum mengambil executable. Tabel executable: `qs`/`quickshell`, `waybar`, `hypridle`, `dunst`, `mako`, `swaync`/`swaync-client`, `hyprpaper`, `swww`/`swww-daemon`, `awww`/`awww-daemon`, `mpvpaper`, `hyprlock`, `hyprsunset`, `hyprpolkitagent`, `pypr`, `fcitx5`. Deteksi ini memakai mekanisme identitas Fase 2b: perintah tanpa argumen ⇒ komponen dengan `exact_argv = true` (bisa dihentikan), perintah dengan argumen literal ⇒ `argv_match` (subset). Perintah **klien sekali-jalan** yang dikenal (`swww restore`, `swww img …`, dan padanan `awww`) **tidak** dianggap daemon: identitasnya ditandai `ask` (+ catatan "perintah klien, mungkin bukan daemon"), sedangkan `swww-daemon` tetap `auto` (§5, Langkah 0).
 
 **⚠ Autostart bentrok (temuan baru — wajib, lihat §6.1).** Baris autostart itu **tetap ada** di config rice. Kalau detector menjadikannya komponen terkelola, `switch` akan **start** komponen itu, sementara `exec-once`/`exec` di config juga menjalankannya → **start ganda**, atau **saling bunuh** saat reload (`exec` jalan ulang tiap `hyprctl reload`; `exec-once` hanya sekali). Karena itu detector **wajib** memunculkan temuan "autostart bentrok" dengan dua opsi penanganan (§6.1) — **default Opsi B** ("dijalankan oleh config": switcher hanya stop) — **tidak** diam-diam membuat komponen start+stop.
 
@@ -222,17 +223,17 @@ Dua bentuk repo:
 
 ---
 
-## 5. Fase 3 — TUI review/edit (BISA)
+## 5. Fase 3 — TUI review/edit (BISA) — ✅ 3a (prompt baris-per-baris); 3b (`curses`) belum
 
 ### 5.1 Teknologi & urutan pembangunan
-- **Prompt baris-per-baris dibangun LEBIH DULU; `curses` paling akhir** (urutan review #1). Jalur non-interaktif memang wajib (`--no-tui`/non-TTY), jadi TUI hanya pembungkus tipis di atasnya. Dengan ini Fase 1–2 (clone + detect + tomlwrite) sudah berguna tanpa menunggu TUI.
+- **Prompt baris-per-baris dibangun LEBIH DULU; `curses` paling akhir** (urutan review #1). Jalur non-interaktif memang wajib (`--no-tui`/non-TTY), jadi TUI hanya pembungkus tipis di atasnya. Dengan ini Fase 1–2 (clone + detect + tomlwrite) sudah berguna tanpa menunggu TUI. ✅ **Fase 3a** sudah mengimplementasikan jalur ini (`rice_switcher/review.py` + `rice_switcher/review_cli.py`); `curses` (Fase 3b) belum.
 - **`curses` (stdlib)** untuk TUI. Alasan: zero-dep (`docs/PLAN.md §5.1`). Bila `stdout` bukan TTY atau `--no-tui` → pakai prompt baris-per-baris (`input()`) + `--yes` menerima default. Ini juga jalur tes.
 - **Single-window list + detail** sudah cukup (keputusan #3).
 
 ### 5.2 Layar
 1. **Input** — URL, lalu nama (menampilkan default dari `derive_name`).
 2. **Progres** — teks status clone.
-3. **Review draft** — daftar komponen; per baris: nama, type, source (`auto`/`guess`/`ask`). Aksi: `Enter` detail/edit, `a` tambah, `d` hapus, `t` ubah type, `e` edit field, `s` simpan.
+3. **Review draft** — daftar komponen; per baris: nama, type, source (`auto`/`guess`/`ask`). Aksi: `Enter` detail/edit, `a` tambah, `d` hapus, `t` ubah type, `e` edit field, `u` undo, `s` simpan, `q` batal. Field `guess`/`ask` ditonjolkan di atas dan wajib dilihat sebelum simpan.
 4. **Gap** — daftar temuan (§6) dengan tombol approve/skip per item.
 5. **Preview plan** — jalankan `compute_plan` + `validate` + dry-run, tampilkan `to_stop/to_start/to_swap` (mirip output `switch --dry-run`).
 6. **Konfirmasi switch** — opsional; default **tidak** switch otomatis (user menjalankan `switch` sendiri), kecuali `--switch`.
@@ -244,8 +245,16 @@ Dua bentuk repo:
 - Semua keputusan TUI dapat direpresentasikan sebagai flag agar bisa diuji tanpa curses.
 
 ### 5.4 Acceptance (Fase 3)
-- Uji logika TUI tanpa curses (driver headless): urutan keputusan → draft final yang diharapkan.
-- Uji smoke `curses` di pseudo-TTY (`pty`) minimal (opsional).
+- ✅ Uji logika TUI tanpa curses (driver headless): urutan keputusan → draft final yang diharapkan (`tests/test_slice3a_review.py`, `tests/test_slice3a_review_cli.py`).
+- ✅ Edit ditolak dengan benar (executable sesi terlarang, `argv_match` kosong tanpa `exact_argv`, `stop` compositor terkunci `"true"`, `pkill -f`) dan tidak mengubah draft.
+- ✅ `q`/EOF membatalkan **tanpa** menyimpan; `--yes` berhenti (exit ≠ 0) bila masih ada field `ask`.
+- ✅ Simpan lewat `tomlwrite` → validate; error validate membatalkan tulis (`tests/test_slice3a_generate_review.py`).
+- ⬜ Uji smoke `curses` di pseudo-TTY (`pty`) minimal — Fase 3b.
+
+### 5.5 Implementasi Fase 3a (revisi #4)
+- **`rice_switcher/review.py`** — model murni (tanpa I/O). `ReviewSession` membungkus `ManifestDraft`; operasi: `set_type`, `set_field` (nama/start/executable/argv_match/exact_argv/stop/start_check), `add`, `remove`, `move`, `undo` (satu langkah, dapat ditumpuk). Setiap edit divalidasi memakai aturan yang sudah ada; field yang diedit user menjadi `auto`; `stop` compositor terkunci `"true"`. `findings()` meneruskan `ManifestDraft.findings` (kosong di 3a; Fase 4 mengisi).
+- **`rice_switcher/review_cli.py`** — driver prompt baris-per-baris. `ask`/`out` disuntikkan (tak pernah memanggil `input()` langsung), sehingga hermetis. Ringkasan menonjolkan field `guess`/`ask` sebelum daftar komponen; perintah `Enter/e/a/d/t/u/s/q`; input tak dikenal dan edit yang ditolak hanya mencetak pesan lalu bertanya lagi; EOF = batal.
+- **`cli.generate`** — flag `--no-tui` (prompt baris) dan `--yes` (terima default tanpa mengubah apa pun). `--yes` menolak simpan bila ada field `ask` (exit 3, daftar ditulis ke stderr). Jalur simpan menserialisasi dengan `tomlwrite`, mem-parse ulang, memvalidasi, dan **tidak menulis** bila ada error; `[meta].name` dipaksa sama dengan nama folder rice. `generate` tanpa flag tetap mencetak draft (perilaku lama tak berubah).
 
 ---
 
@@ -357,7 +366,7 @@ Dua bentuk repo:
 | **P0** | **Prasyarat 0**: kill-by-identity (`process.py`/`lifecycle.py`) + tolak nama berawalan titik | — | `stop` kosong → komponen benar-benar berhenti; rice yang punya `stop` tak berubah; tes hijau |
 | 1 | `clone` + naming (hardened) | P0 | BISA penuh; tes keamanan hijau |
 | 2 | `detect` + `tomlwrite` (draft) | 1 | draft benar untuk fixture; round-trip hijau |
-| 3a | review/edit via **prompt baris-per-baris** | 2 | draft bisa di-review & disimpan tanpa curses |
+| 3a | review/edit via **prompt baris-per-baris** ✅ | 2 | draft bisa di-review & disimpan tanpa curses |
 | 3b | TUI `curses` (pembungkus) | 3a | single-window list+detail; jalur non-TTY tetap ada |
 | 4 | deteksi gap + approve (+ autostart bentrok) | 3a | gap terdeteksi; tak ada eksekusi tanpa approve |
 | 5 | prompt cleanup | 3a | hapus aman (no-follow) + retensi + konsekuensi disebut |
