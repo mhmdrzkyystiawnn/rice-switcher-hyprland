@@ -10,6 +10,13 @@ Hard rules (DESIGN §1, §10):
   Autostart lines are matched with regexes; only a pure string literal is
   turned into a command. A concatenation or a dynamic expression is
   reported as `ask` and never guessed.
+* **Reachability.** Components come from autostart lines in files that are
+  actually reachable from the Hyprland entrypoint (`hyprland.lua`/`.conf`),
+  following `source =` (hyprlang) and literal `require(...)`/`dofile(...)`
+  (Lua) only while they stay inside the rice dir. Archive/backup/profile
+  files that are not reachable never create components; their refs are
+  recorded with `reachable=False` (for Fase 4). When no entrypoint is
+  readable we do **not** fall back to scanning everything; we report it.
 * **Containment.** Every path is checked with `realpath` + `commonpath`
   against the rice directory. A symlink that escapes the rice dir is
   reported and never followed or read.
@@ -30,6 +37,7 @@ from __future__ import annotations
 import os
 import re
 import shlex
+from collections import deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Iterable
 
@@ -46,8 +54,10 @@ _RANK = {CONF_AUTO: 0, CONF_GUESS: 1, CONF_ASK: 2}
 MAX_FILES = 5000
 MAX_FILE_BYTES = 512 * 1024
 MAX_DEPTH = 12
+MAX_SOURCE_DEPTH = 24          # `source=`/`require`/`dofile` follow depth
 
-# binary -> (component name, type). Aligned with manifest.VALID_TYPES.
+# Executable basename -> (component name, type). Aligned with
+# manifest.VALID_TYPES. Data table, not if/else (Langkah 3).
 KNOWN_BINARIES = {
     "qs": ("quickshell", "shell"),
     "quickshell": ("quickshell", "shell"),
@@ -56,11 +66,18 @@ KNOWN_BINARIES = {
     "dunst": ("dunst", "notifications"),
     "mako": ("mako", "notifications"),
     "swaync": ("swaync", "notifications"),
+    "swaync-client": ("swaync", "notifications"),
     "hyprpaper": ("hyprpaper", "wallpaper"),
     "swww": ("swww", "wallpaper"),
+    "swww-daemon": ("swww", "wallpaper"),
     "awww": ("awww", "wallpaper"),
+    "awww-daemon": ("awww", "wallpaper"),
     "mpvpaper": ("mpvpaper", "wallpaper"),
     "hyprlock": ("hyprlock", "locker"),
+    "hyprsunset": ("hyprsunset", "system"),
+    "hyprpolkitagent": ("hyprpolkitagent", "system"),
+    "pypr": ("pypr", "system"),
+    "fcitx5": ("fcitx5", "system"),
 }
 
 # Directory name -> (component name, type), for config-dir signals.
@@ -75,9 +92,21 @@ DIR_SIGNALS = {
     "mpvpaper": ("mpvpaper", "wallpaper"),
 }
 
+# Directories that are never treated as live configuration (Langkah 3):
+# archived profiles, backups and examples must not create components.
+IGNORED_DIRS = frozenset({
+    "archive", "old", "backup", "bak", "examples", "example",
+})
+
+# Entrypoint candidates, relative to the config root, in preference order.
+ENTRYPOINT_CANDIDATES = (
+    "hypr/hyprland.lua", "hypr/hyprland.conf",
+    "hyprland.lua", "hyprland.conf",
+)
+
 _FIELD_ORDER = (
-    "type", "executable", "argv_match", "start", "stop", "start_check",
-    "reload", "config_link", "depends_on", "optional", "timeout",
+    "type", "executable", "argv_match", "exact_argv", "start", "stop",
+    "start_check", "reload", "config_link", "depends_on", "optional", "timeout",
 )
 
 _SUSPICIOUS_CHARS = set(";&|`<>*?[]{}()\"'\\")
@@ -89,6 +118,14 @@ _HYPR_EXEC_RE = re.compile(r'^\s*(exec-once|exec)\s*=\s*(.*)$')
 _HYPR_VAR_RE = re.compile(r'^\s*\$([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$')
 _HYPR_SOURCE_RE = re.compile(r'^\s*source\s*=\s*(.+)$')
 _VAR_REF_RE = re.compile(r'\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?')
+
+# Lua reachability (Langkah 3). Only *literal* module/path strings are
+# followed, and only when they resolve inside the rice directory.
+_LUA_REQUIRE_RE = re.compile(
+    r'\brequire\s*\(\s*(["\'])((?:[^"\\]|\\.)*)\1\s*\)'
+    r'|\brequire\s*,\s*(["\'])((?:[^"\\]|\\.)*)\3')
+_LUA_DOFILE_RE = re.compile(
+    r'\b(?:dofile|loadfile)\s*\(\s*(["\'])((?:[^"\\]|\\.)*)\1\s*\)')
 
 _LUA_ESCAPES = {
     "n": "\n", "t": "\t", "r": "\r", "\\": "\\", '"': '"',
@@ -119,6 +156,7 @@ class DraftComponent:
     type: Field
     executable: Field = field(default_factory=Field)
     argv_match: Field = field(default_factory=lambda: Field([]))
+    exact_argv: Field = field(default_factory=lambda: Field(False))
     start: Field = field(default_factory=Field)
     stop: Field = field(default_factory=Field)
     start_check: Field = field(default_factory=Field)
@@ -144,9 +182,9 @@ class DraftComponent:
         stopping in `lifecycle.stop_component`.
         """
         d: dict = {"name": self.name, "type": self.type.value}
-        for key in ("executable", "argv_match", "start", "start_check",
-                    "reload", "config_link", "depends_on", "optional",
-                    "timeout"):
+        for key in ("executable", "argv_match", "exact_argv", "start",
+                    "start_check", "reload", "config_link", "depends_on",
+                    "optional", "timeout"):
             value = getattr(self, key).value
             if key == "timeout" and value == 10:
                 continue
@@ -165,6 +203,7 @@ class AutostartRef:
     raw: str           # raw text as found (for Fase 4)
     command: str = ""  # extracted literal (unresolved), "" if dynamic
     confidence: str = CONF_AUTO
+    reachable: bool = True   # False when only an archive/profile/backup file
 
 
 @dataclass(frozen=True)
@@ -328,9 +367,217 @@ def _suspicious(token: str) -> bool:
     return any(ch in _SUSPICIOUS_CHARS for ch in token)
 
 
-def _parse_texts(texts: dict[str, str]) -> tuple[dict[str, str], list[AutostartRef]]:
+def _split_commands(cmd: str) -> list[str]:
+    """Split a shell-ish command line into independent sub-commands.
+
+    Splits on `&&`, `||`, `;`, `|`, `&`, honouring single/double quotes so
+    an operator inside a quoted argument does not split. Never evaluates.
+    """
+    parts: list[str] = []
+    buf: list[str] = []
+    quote: str | None = None
+    i = 0
+    while i < len(cmd):
+        ch = cmd[i]
+        if quote is not None:
+            buf.append(ch)
+            if ch == "\\" and i + 1 < len(cmd):
+                buf.append(cmd[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in "\"'":
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+        two = cmd[i:i + 2]
+        if two in ("&&", "||"):
+            parts.append("".join(buf))
+            buf = []
+            i += 2
+            continue
+        if ch in ";|&":
+            parts.append("".join(buf))
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    parts.append("".join(buf))
+    return [p.strip() for p in parts if p.strip()]
+
+
+_WRAPPER_EXEC = frozenset({"exec", "setsid", "nohup"})
+_DURATION_RE = re.compile(r"^\d+(\.\d+)?$")
+_ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _strip_wrappers(tokens: list[str]) -> list[str]:
+    """Drop leading wrappers so the real executable is first.
+
+    Handles `sleep N`, `env VAR=...` (and a bare leading `VAR=...`),
+    `exec`, `setsid`, `nohup`, `uwsm app [opts] -- CMD`, and
+    `systemd-run [opts] -- CMD`. Returns [] for a command that is only a
+    wrapper (e.g. `sleep .5`).
+    """
+    toks = list(tokens)
+    while toks:
+        head = toks[0]
+        if _ENV_ASSIGN_RE.match(head):
+            toks = toks[1:]
+            continue
+        if head in _WRAPPER_EXEC:
+            toks = toks[1:]
+            continue
+        if head == "sleep":
+            if len(toks) >= 2 and _DURATION_RE.match(toks[1]):
+                toks = toks[2:]
+            else:
+                toks = toks[1:]
+            continue
+        if head == "env":
+            toks = toks[1:]
+            while toks and _ENV_ASSIGN_RE.match(toks[0]):
+                toks = toks[1:]
+            continue
+        if head == "uwsm" and len(toks) >= 2 and toks[1] == "app":
+            toks = toks[2:]
+            while toks and toks[0] not in ("--",) and toks[0].startswith("-"):
+                toks = toks[1:]
+            if toks and toks[0] == "--":
+                toks = toks[1:]
+            continue
+        if head == "systemd-run":
+            rest = toks[1:]
+            if "--" in rest:
+                rest = rest[rest.index("--") + 1:]
+            else:
+                while rest and rest[0].startswith("-"):
+                    rest = rest[1:]
+            toks = rest
+            continue
+        break
+    return toks
+
+
+def _under_ignored_dir(rel: str) -> bool:
+    """True if any parent directory of `rel` is an archive/backup/example."""
+    parts = rel.split(os.sep)
+    return any(p in IGNORED_DIRS for p in parts[:-1])
+
+
+def _real_rel(path: str, rice_real: str, real_to_rel: dict[str, str]) -> str | None:
+    """Resolve `path` to a rice-relative text file, or None.
+
+    Containment: the realpath must be inside the rice directory, and it
+    must be a file we actually loaded (i.e. a readable .lua/.conf).
+    """
+    try:
+        rp = os.path.realpath(path)
+    except OSError:
+        return None
+    if not _inside(rice_real, rp):
+        return None
+    return real_to_rel.get(rp)
+
+
+def _module_candidates(mod: str, base_dir: str, rice_dir: str) -> list[str]:
+    """Filesystem candidates for a Lua `require("<mod>")`."""
+    rel = mod.replace(".", os.sep)
+    out = []
+    for base in (base_dir, rice_dir):
+        out.append(os.path.join(base, rel + ".lua"))
+        out.append(os.path.join(base, rel, "init.lua"))
+    return out
+
+
+def _refs_from_text(text: str, rel: str, rice_dir: str,
+                    rice_real: str, real_to_rel: dict[str, str]) -> list[str]:
+    """Rice-relative files this text pulls in (`source=`/`require`/`dofile`)."""
+    refs: list[str] = []
+    base_dir = os.path.join(rice_dir, os.path.dirname(rel))
+    for line in text.splitlines():
+        s = _HYPR_SOURCE_RE.match(line)
+        if s:
+            rhs = _strip_hypr_comment(s.group(1)).strip().strip('"').strip("'")
+            if rhs and "$" not in rhs:
+                cand = (rhs if os.path.isabs(rhs) or rhs.startswith("~")
+                        else os.path.join(base_dir, rhs))
+                r = _real_rel(os.path.expanduser(cand), rice_real, real_to_rel)
+                if r:
+                    refs.append(r)
+    for m in _LUA_REQUIRE_RE.finditer(text):
+        mod = _unescape_lua(m.group(2) or m.group(4) or "")
+        if not mod or "$" in mod or " " in mod:
+            continue
+        for cand in _module_candidates(mod, base_dir, rice_dir):
+            r = _real_rel(cand, rice_real, real_to_rel)
+            if r:
+                refs.append(r)
+    for m in _LUA_DOFILE_RE.finditer(text):
+        p = _unescape_lua(m.group(2))
+        if not p or "$" in p:
+            continue
+        cand = (p if os.path.isabs(p) or p.startswith("~")
+                else os.path.join(base_dir, p))
+        r = _real_rel(os.path.expanduser(cand), rice_real, real_to_rel)
+        if r:
+            refs.append(r)
+    return refs
+
+
+def _find_entrypoints(cfg: str, rice_dir: str, rice_real: str,
+                      real_to_rel: dict[str, str]) -> list[str]:
+    """Existing, readable Hyprland entrypoints (rice-relative), ordered."""
+    cfg_rel = os.path.relpath(cfg, rice_dir)
+    out: list[str] = []
+    seen: set[str] = set()
+    for cand in ENTRYPOINT_CANDIDATES:
+        rel = os.path.normpath(os.path.join(cfg_rel, cand))
+        if rel in seen or _under_ignored_dir(rel):
+            continue
+        r = _real_rel(os.path.join(rice_dir, rel), rice_real, real_to_rel)
+        if r is not None:
+            seen.add(r)
+            out.append(r)
+    return out
+
+
+def _reachable(entrypoints: list[str], texts: dict[str, str], rice_dir: str,
+               rice_real: str, real_to_rel: dict[str, str]) -> set[str]:
+    """BFS the reachability graph from the entrypoints (cycle-safe, bounded)."""
+    seen: set[str] = set()
+    queue: deque[tuple[str, int]] = deque((e, 0) for e in entrypoints)
+    while queue:
+        rel, depth = queue.popleft()
+        if rel in seen:
+            continue
+        seen.add(rel)
+        if depth >= MAX_SOURCE_DEPTH:
+            continue
+        text = texts.get(rel)
+        if text is None:
+            continue
+        for nxt in _refs_from_text(text, rel, rice_dir, rice_real, real_to_rel):
+            if nxt not in seen and not _under_ignored_dir(nxt):
+                queue.append((nxt, depth + 1))
+    return seen
+
+
+def _parse_texts(texts: dict[str, str], reachable: set[str]) -> tuple[dict[str, str], list[AutostartRef]]:
+    """Resolve `$vars` (from reachable files) and collect autostart refs.
+
+    Refs from unreachable files are still recorded (with
+    `reachable=False`, for Fase 4) but never create components.
+    """
     var_map: dict[str, str] = {}
     for rel, text in texts.items():
+        if rel not in reachable:
+            continue
         for line in text.splitlines():
             m = _LUA_ENV_RE.search(line)
             if m:
@@ -342,22 +589,24 @@ def _parse_texts(texts: dict[str, str]) -> tuple[dict[str, str], list[AutostartR
 
     refs: list[AutostartRef] = []
     for rel, text in texts.items():
+        reach = rel in reachable
         for i, line in enumerate(text.splitlines(), 1):
             commented = line.lstrip().startswith("--")
             m = _LUA_EXEC_RE.search(line)
             if m and not commented:
                 refs.append(AutostartRef(rel, i, "hl.exec_cmd", line.strip(),
-                                         _unescape_lua(m.group(1)), CONF_AUTO))
+                                         _unescape_lua(m.group(1)), CONF_AUTO,
+                                         reach))
                 continue
             if "hl.exec_cmd(" in line and not commented:
                 refs.append(AutostartRef(rel, i, "hl.exec_cmd", line.strip(),
-                                         "", CONF_ASK))
+                                         "", CONF_ASK, reach))
                 continue
             h = _HYPR_EXEC_RE.match(line)
             if h:
                 rhs = _strip_hypr_comment(h.group(2)).strip()
                 refs.append(AutostartRef(rel, i, h.group(1), line.strip(),
-                                         rhs.strip('"'), CONF_AUTO))
+                                         rhs.strip('"'), CONF_AUTO, reach))
     return var_map, refs
 
 
@@ -382,12 +631,15 @@ def _load_texts(files: Iterable[tuple[str, str]], rice_real: str,
 
 def _comp(name: str, ctype: str, exe: str, start: str, argv: list[str],
           argv_conf: str, config_link: str, link_conf: str,
-          start_check: str, source: str, start_conf: str = CONF_AUTO) -> DraftComponent:
+          start_check: str, source: str, start_conf: str = CONF_AUTO,
+          *, exact: bool = False,
+          exact_conf: str = CONF_AUTO) -> DraftComponent:
     return DraftComponent(
         name=name,
         type=Field(ctype, CONF_AUTO),
         executable=Field(exe, CONF_AUTO),
         argv_match=Field(list(argv), argv_conf),
+        exact_argv=Field(bool(exact), exact_conf),
         start=Field(start, start_conf),
         stop=Field("", CONF_AUTO),
         start_check=Field(start_check, CONF_AUTO),
@@ -403,6 +655,7 @@ def _add(comps: dict[str, DraftComponent], dc: DraftComponent) -> None:
         return
     if _RANK[dc.argv_match.confidence] < _RANK[cur.argv_match.confidence]:
         cur.argv_match = dc.argv_match
+        cur.exact_argv = dc.exact_argv
         cur.start = dc.start
         cur.executable = dc.executable
     if not cur.config_link.value and dc.config_link.value:
@@ -413,11 +666,22 @@ def _add(comps: dict[str, DraftComponent], dc: DraftComponent) -> None:
         cur.source = dc.source
 
 
-def _component_from_autostart(ref: AutostartRef, var_map: dict[str, str]):
-    if not ref.command:
-        return None
-    resolved, unresolved = _resolve_vars(ref.command, var_map)
-    tokens = _tokenize(resolved)
+def _start_check_for(name: str) -> str:
+    return f"pgrep -x {name}" if name in ("waybar", "quickshell", "hypridle") else ""
+
+
+def _component_from_command(raw: str, ref: AutostartRef,
+                            var_map: dict[str, str]) -> DraftComponent | None:
+    """Build a component from one literal sub-command, or None.
+
+    Identity is derived from the literal argv of the sub-command:
+    a command with no arguments becomes an exact no-argument identity
+    (`exact_argv=true`), a command with literal arguments uses an
+    `argv_match` subset. Unresolved variables or dynamic quoting make the
+    fields `ask` — we never invent an identity.
+    """
+    resolved, unresolved = _resolve_vars(raw, var_map)
+    tokens = _strip_wrappers(_tokenize(resolved))
     if not tokens:
         return None
     exe = os.path.basename(tokens[0])
@@ -425,13 +689,27 @@ def _component_from_autostart(ref: AutostartRef, var_map: dict[str, str]):
         return None
     name, ctype = KNOWN_BINARIES[exe]
     argv = tokens[1:]
-    argv_conf = CONF_AUTO
-    if not argv or unresolved or any(_suspicious(t) for t in argv):
-        argv_conf = CONF_ASK
+    literal = not unresolved and not any(_suspicious(t) for t in tokens)
+    argv_conf = CONF_AUTO if literal else CONF_ASK
     start_conf = CONF_ASK if unresolved else CONF_AUTO
-    start_check = f"pgrep -x {exe}" if name in ("waybar", "quickshell", "hypridle") else ""
-    return _comp(name, ctype, exe, resolved, argv, argv_conf, "", CONF_AUTO,
-                 start_check, f"autostart:{ref.file}:{ref.line}", start_conf)
+    exact = literal and not argv
+    start = " ".join(tokens)
+    return _comp(name, ctype, exe, start, argv, argv_conf, "", CONF_AUTO,
+                 _start_check_for(name), f"autostart:{ref.file}:{ref.line}",
+                 start_conf, exact=exact, exact_conf=CONF_AUTO)
+
+
+def _components_from_autostart(ref: AutostartRef,
+                               var_map: dict[str, str]) -> list[DraftComponent]:
+    """Components from one autostart line (a line may run several commands)."""
+    if not ref.command or not ref.reachable:
+        return []
+    out: list[DraftComponent] = []
+    for piece in _split_commands(ref.command):
+        dc = _component_from_command(piece, ref, var_map)
+        if dc is not None:
+            out.append(dc)
+    return out
 
 
 def _add_dir_signals(comps: dict[str, DraftComponent], cfg: str, draft: ManifestDraft) -> None:
@@ -459,7 +737,7 @@ def _add_dir_signals(comps: dict[str, DraftComponent], cfg: str, draft: Manifest
             or os.path.isfile(os.path.join(cfg, "waybar", "style.css"))):
         _add(comps, _comp("waybar", "bar", "waybar", "waybar", [], CONF_ASK,
                           "~/.config/waybar", CONF_AUTO, "pgrep -x waybar",
-                          "dir:waybar"))
+                          "dir:waybar", exact=True))
 
     # quickshell.
     qs_root = os.path.join(cfg, "quickshell")
@@ -483,27 +761,28 @@ def _add_dir_signals(comps: dict[str, DraftComponent], cfg: str, draft: Manifest
                     f"pilih satu")
             _add(comps, _comp("quickshell", "shell", "qs", "qs", [], CONF_ASK,
                               "~/.config/quickshell", CONF_AUTO, "pgrep -x qs",
-                              "dir:quickshell"))
+                              "dir:quickshell", exact=True))
 
     # hypridle (config lives inside ~/.config/hypr, so no separate link).
     if (os.path.isfile(os.path.join(cfg, "hypridle.conf"))
             or os.path.isfile(os.path.join(cfg, "hypr", "hypridle.conf"))):
         _add(comps, _comp("hypridle", "system", "hypridle", "hypridle", [],
                           CONF_ASK, "", CONF_AUTO, "pgrep -x hypridle",
-                          "dir:hypridle.conf"))
+                          "dir:hypridle.conf", exact=True))
 
     # Notifications / wallpaper daemons by config dir.
     for dirname, (name, ctype) in DIR_SIGNALS.items():
         if os.path.isdir(os.path.join(cfg, dirname)):
             _add(comps, _comp(name, ctype, name, name, [], CONF_ASK,
                               f"~/.config/{dirname}", CONF_GUESS, "",
-                              f"dir:{dirname}"))
+                              f"dir:{dirname}", exact=True))
 
     # hyprpaper config file (covered by ~/.config/hypr when it is managed).
     if (os.path.isfile(os.path.join(cfg, "hyprpaper.conf"))
             or os.path.isfile(os.path.join(cfg, "hypr", "hyprpaper.conf"))):
         _add(comps, _comp("hyprpaper", "wallpaper", "hyprpaper", "hyprpaper",
-                          [], CONF_ASK, "", CONF_AUTO, "", "dir:hyprpaper.conf"))
+                          [], CONF_ASK, "", CONF_AUTO, "", "dir:hyprpaper.conf",
+                          exact=True))
 
 
 # ---------------------------------------------------------------------------
@@ -530,18 +809,43 @@ def detect(rice_dir: str, *, roots: "Roots | None" = None) -> ManifestDraft:
     draft.notes.extend(walk_notes)
 
     texts = _load_texts(files, rice_real, draft.notes)
-    var_map, refs = _parse_texts(texts)
+
+    # Map realpath -> rice-relative name so source/require resolution can
+    # only ever point at files we actually loaded (containment).
+    real_to_rel: dict[str, str] = {}
+    for rel, abspath in files:
+        if rel in texts:
+            real_to_rel[os.path.realpath(abspath)] = rel
+
+    entrypoints = _find_entrypoints(cfg, rice_dir, rice_real, real_to_rel)
+    reachable = _reachable(entrypoints, texts, rice_dir, rice_real, real_to_rel)
+
+    var_map, refs = _parse_texts(texts, reachable)
     draft.autostart_refs = refs
 
     comps: dict[str, DraftComponent] = {}
     autostart_names: set[str] = set()
     for ref in refs:
-        dc = _component_from_autostart(ref, var_map)
-        if dc is not None:
+        for dc in _components_from_autostart(ref, var_map):
             autostart_names.add(dc.name)
             _add(comps, dc)
 
     _add_dir_signals(comps, cfg, draft)
+
+    if not entrypoints:
+        draft.notes.append(
+            "tidak ada entrypoint Hyprland (hyprland.lua/.conf) yang bisa dibaca; "
+            "autostart tidak dipindai (rice mungkin butuh materialisasi — Fase 4)")
+    else:
+        unreachable_refs = [r for r in refs if not r.reachable and r.file]
+        if unreachable_refs:
+            files_seen = []
+            for r in unreachable_refs:
+                if r.file not in files_seen:
+                    files_seen.append(r.file)
+            draft.notes.append(
+                "autostart di berkas tak terjangkau diabaikan (arsip/profil "
+                "tidak aktif): " + ", ".join(files_seen[:8]))
 
     for name in sorted(autostart_names):
         dc = comps[name]

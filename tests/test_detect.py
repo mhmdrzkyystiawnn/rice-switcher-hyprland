@@ -131,8 +131,11 @@ class AutostartTest(unittest.TestCase):
             self.assertTrue(r.raw)
 
     def test_lua_exec_cmd_with_env_indirection(self):
-        # Mirrors the real elifouts layout.
+        # Mirrors the real elifouts layout: entrypoint -> variables + execs.
         rice = _mkrice(self.tmp, "r", {
+            "hypr/hyprland.lua":
+                'require("variables")\n'
+                'require("execs")\n',
             "hypr/variables.lua": 'hl.env("qsConfig", "ii")\n',
             "hypr/execs.lua":
                 'hl.on("hyprland.start", function ()\n'
@@ -166,6 +169,7 @@ class AutostartTest(unittest.TestCase):
 
     def test_unresolved_variable_is_ask(self):
         rice = _mkrice(self.tmp, "r", {
+            "hypr/hyprland.lua": 'require("execs")\n',
             "hypr/execs.lua": 'hl.exec_cmd("qs -c $unknownCfg")\n',
         })
         d = detect(rice, roots=_roots(self.tmp))
@@ -175,6 +179,7 @@ class AutostartTest(unittest.TestCase):
 
     def test_dynamic_lua_expression_is_ask(self):
         rice = _mkrice(self.tmp, "r", {
+            "hypr/hyprland.lua": 'require("execs")\n',
             "hypr/execs.lua": 'hl.exec_cmd("qs -c " .. cfg)\n',
         })
         d = detect(rice, roots=_roots(self.tmp))
@@ -184,18 +189,22 @@ class AutostartTest(unittest.TestCase):
 
     def test_commented_out_exec_ignored(self):
         rice = _mkrice(self.tmp, "r", {
+            "hypr/hyprland.lua": 'require("execs")\n',
             "hypr/execs.lua": '--hl.exec_cmd("qs -c ii")\n',
         })
         d = detect(rice, roots=_roots(self.tmp))
         self.assertNotIn("quickshell", _names(d))
 
-    def test_argless_daemon_argv_is_ask(self):
+    def test_argless_daemon_gets_exact_noarg_identity(self):
+        # Fase 2b Langkah 1 + 3: an argument-less daemon is given an
+        # explicit exact identity so the draft can actually be stopped.
         rice = _mkrice(self.tmp, "r", {"hypr/hyprland.conf": "exec-once = hypridle\n"})
         d = detect(rice, roots=_roots(self.tmp))
         h = _by_name(d, "hypridle")
         self.assertEqual(h.start.value, "hypridle")
         self.assertEqual(h.argv_match.value, [])
-        self.assertEqual(h.argv_match.confidence, CONF_ASK)
+        self.assertTrue(h.exact_argv.value)
+        self.assertEqual(h.stop.value, "")
 
     def test_autostart_conflict_noted(self):
         rice = _mkrice(self.tmp, "r", {"hypr/hyprland.conf": "exec-once = waybar\n"})
@@ -204,11 +213,15 @@ class AutostartTest(unittest.TestCase):
         self.assertIn("autostart", joined.lower())
 
     def test_autostart_refs_record_file_line_kind_raw(self):
-        rice = _mkrice(self.tmp, "r", {"hypr/execs.lua": '\nhl.exec_cmd("waybar")\n'})
+        rice = _mkrice(self.tmp, "r", {
+            "hypr/hyprland.lua": 'require("execs")\n',
+            "hypr/execs.lua": '\nhl.exec_cmd("waybar")\n',
+        })
         d = detect(rice, roots=_roots(self.tmp))
         ref = next(r for r in d.autostart_refs if r.kind == "hl.exec_cmd")
         self.assertEqual(ref.line, 2)
         self.assertIn("waybar", ref.raw)
+        self.assertTrue(ref.reachable)
 
 
 class DirSignalTest(unittest.TestCase):

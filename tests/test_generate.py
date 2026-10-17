@@ -102,7 +102,8 @@ class GeneratePrintTest(GenerateTestBase):
         self.assertEqual(waybar["stop"], "")
 
     def test_ask_fields_surface_as_todo_and_review(self):
-        self.mkrice("r", {"hypr/hyprland.conf": "exec-once = hypridle\n"})
+        # An unresolved variable is genuinely ambiguous -> ask.
+        self.mkrice("r", {"hypr/hyprland.conf": "exec-once = qs -c $unknownCfg\n"})
         rc, out, err = self.run_cli("generate", "r")
         self.assertEqual(rc, 0, err)
         self.assertIn("TODO(ask)", out)
