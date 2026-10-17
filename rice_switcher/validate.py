@@ -311,6 +311,29 @@ def validate_manifest(
                 f"component {c.name!r}: executable should be a basename, "
                 f"got {c.executable!r}"
             )
+        # Fase 2b Langkah 2: a managed component with a meaningful `start`
+        # but a no-op `stop` will be started on every switch and never
+        # stopped, so switching to this rice leaves a duplicate running.
+        # A no-op stop is `true`/`:` (a shell command that does nothing),
+        # or an empty `stop` whose identity cannot be pinned down (no
+        # `argv_match` and no `exact_argv`). The compositor is exempt
+        # because the switcher never stops or starts it (PLAN.md §2c).
+        start_meaningful = bool(c.start) and c.start.strip() not in ("true", ":")
+        stop_raw = c.stop.strip()
+        if stop_raw in ("true", ":"):
+            stop_is_noop = True
+        elif stop_raw == "":
+            stop_is_noop = not (bool(c.argv_match) or bool(c.exact_argv))
+        else:
+            stop_is_noop = False
+        if c.type != "compositor" and start_meaningful and stop_is_noop:
+            res.warnings.append(
+                f"component {c.name!r}: `start` is set but `stop` is a no-op "
+                f"({c.stop!r}); this component can never be stopped, so a "
+                f"switch will start a duplicate instance — set a real `stop`, "
+                f"or pin the identity (`argv_match`/`exact_argv`) with an "
+                f"empty `stop`"
+            )
         # Prasyarat 0 (§4.2): refuse session-critical executables. The
         # compositor is exempt (it names `hyprland` on purpose and is
         # never killed); every other component must not point at a
