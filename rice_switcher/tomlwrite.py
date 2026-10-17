@@ -158,35 +158,44 @@ def _has_direct(table: dict) -> bool:
     return any(_is_plain(v) or _is_aot(v) for v in table.values())
 
 
-def _emit_table(lines: list[str], table: dict, path: tuple, comments) -> None:
+def _emit_table(lines: list[str], table: dict, path: tuple, comments,
+                cpath: tuple | None = None) -> None:
+    # `path` drives TOML headers; `cpath` drives comment lookup and differs
+    # inside array-of-tables, where a component is addressed by index
+    # ("components.0") even though its header is just `[[components]]`.
+    cpath = path if cpath is None else cpath
+
     scalars = [(k, v) for k, v in table.items() if _is_plain(v)]
     tables = [(k, v) for k, v in table.items() if isinstance(v, dict)]
     aots = [(k, v) for k, v in table.items() if _is_aot(v)]
 
     for k, v in scalars:
-        _emit_comment(lines, comments, path + (k,))
+        _emit_comment(lines, comments, cpath + (k,))
         lines.append(f"{_key(k)} = {_format_scalar(v)}")
 
     for k, sub in tables:
         subpath = path + (k,)
+        sub_cpath = cpath + (k,)
         if not sub:
-            _emit_comment(lines, comments, subpath)
+            _emit_comment(lines, comments, sub_cpath)
             lines.append(f"[{_dotted(subpath)}]")
         elif _has_direct(sub):
-            _emit_comment(lines, comments, subpath)
+            _emit_comment(lines, comments, sub_cpath)
             lines.append(f"[{_dotted(subpath)}]")
-            _emit_table(lines, sub, subpath, comments)
+            _emit_table(lines, sub, subpath, comments, sub_cpath)
         else:
             # Only nested tables inside: skip this header and let the
             # children emit their own dotted headers.
-            _emit_table(lines, sub, subpath, comments)
+            _emit_table(lines, sub, subpath, comments, sub_cpath)
 
     for k, arr in aots:
         subpath = path + (k,)
+        sub_cpath = cpath + (k,)
         for i, elem in enumerate(arr):
-            _emit_comment(lines, comments, subpath + (str(i),), fallback=subpath)
+            elem_cpath = sub_cpath + (str(i),)
+            _emit_comment(lines, comments, elem_cpath, fallback=sub_cpath)
             lines.append(f"[[{_dotted(subpath)}]]")
-            _emit_table(lines, elem, subpath, comments)
+            _emit_table(lines, elem, subpath, comments, elem_cpath)
 
 
 def dump(

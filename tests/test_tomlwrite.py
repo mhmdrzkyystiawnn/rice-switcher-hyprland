@@ -206,6 +206,12 @@ class CommentTest(unittest.TestCase):
                    comments={"components.0": "TODO(ask): verify identity"})
         self.assertIn("# TODO(ask): verify identity", out)
 
+    def test_aot_element_field_comment_emitted(self):
+        # Comment keys are indexed: a field inside the first element.
+        out = dump({"components": [{"argv_match": []}, {"argv_match": ["-c"]}]},
+                   comments={"components.0.argv_match": "TODO(ask): decide"})
+        self.assertIn("# TODO(ask): decide", out)
+
     def test_comment_content_cannot_inject_lines(self):
         out = dump({"meta": {"name": "x"}},
                    comments={"meta.name": "line1\nline2\x01extra"})
