@@ -1,0 +1,301 @@
+"""Top-level switch orchestrator.
+
+PLAN.md §3.2 (pseudocode for `rice-switcher switch`). This module glues
+together validate, managed_set, snapshot, lock, and state. Slice 1
+implements the algorithm but **does not** perform real process management
+or real Hyprland reload: see §11.1 for the explicit Slice-1 contract.
+
+The orchestrator respects:
+  * `--dry-run` / `RICE_DRY_RUN=1`: print the plan, change nothing.
+  * `RICE_TEST=1`: stub out every external command. Used by tests.
+  * Compositor invariant: never stops or starts the compositor.
+  * Managed-set invariant: never touches components outside it.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+from dataclasses import dataclass
+
+from .lock import LockError, switch_lock
+from .log import append_audit, setup_logging
+from .managed_set import Identity, SwitchPlan, compute_plan
+from .manifest import Manifest
+from .paths import (
+    Roots,
+    audit_log_file,
+    manifest_path,
+    state_file,
+)
+from .snapshot import (
+    SnapshotInfo,
+    commit as commit_snapshot,
+    create_pending,
+    current_symlinks_state,
+    discard_pending,
+    prune as prune_snapshots,
+    restore as restore_snapshot,
+    swap_symlink,
+)
+from .state import State, mark_trust, read_state, write_state
+from .validate import ValidationError, ValidationResult, validate_manifest
+
+
+@dataclass
+class SwitchOutcome:
+    plan: SwitchPlan
+    snapshot_ts: str | None
+    dry_run: bool
+    errors: list[str]
+    warnings: list[str]
+
+
+# ---------------------------------------------------------------------------
+# Sub-step helpers
+# ---------------------------------------------------------------------------
+
+def _gather_config_links(manifest: Manifest) -> list[str]:
+    return [c.config_link for c in manifest.components if c.config_link]
+
+
+def _print_plan(plan: SwitchPlan, roots: Roots) -> str:
+    lines: list[str] = []
+    lines.append(f"Switch plan: {plan.current or '<none>'} -> {plan.target}")
+    lines.append(f"  to_stop ({len(plan.to_stop)}):")
+    for i in plan.to_stop:
+        lines.append(f"    - {i}")
+    lines.append(f"  to_start ({len(plan.to_start)}):")
+    for i in plan.to_start:
+        lines.append(f"    + {i}")
+    lines.append(f"  to_reload ({len(plan.to_reload)}):")
+    for i in plan.to_reload:
+        lines.append(f"    ~ {i}")
+    lines.append(f"  to_keep ({len(plan.to_keep)}):")
+    for i in plan.to_keep:
+        lines.append(f"    = {i}")
+    lines.append(f"  to_swap ({len(plan.to_swap)}):")
+    for p in plan.to_swap:
+        lines.append(f"    @ {p}")
+    for n in plan.notes:
+        lines.append(f"  note: {n}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Main entry
+# ---------------------------------------------------------------------------
+
+def do_switch(
+    roots: Roots,
+    target_name: str,
+    all_manifests: list[Manifest],
+    *,
+    dry_run: bool = True,
+    force_real: bool = False,
+    logger=None,
+) -> SwitchOutcome:
+    """Plan and (optionally) execute a switch.
+
+    Parameters
+    ----------
+    roots : resolved filesystem roots (see `paths.resolve_roots`).
+    target_name : name of the rice to switch into.
+    all_manifests : every manifest the switcher knows about. The
+        managed set is computed from this list.
+    dry_run : if True (default), print the plan and return without
+        touching the filesystem. Caller may pass --no-dry-run to
+        override; we also honour the RICE_DRY_RUN env var.
+    force_real : when True, real execution is allowed (Slice 1 stub:
+        we still do NOT touch the real desktop; the flag is reserved
+        for future slices). The flag's job is to require an explicit
+        opt-in.
+    logger : optional logger; if absent, a default one is set up.
+    """
+    if logger is None:
+        logger = setup_logging(roots)
+
+    # Force dry-run if env var is set.
+    if os.environ.get("RICE_DRY_RUN") == "1":
+        dry_run = True
+
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    # 1. Find the target manifest
+    target_m = next((m for m in all_manifests if m.meta.name == target_name), None)
+    if target_m is None:
+        return SwitchOutcome(
+            plan=SwitchPlan(target=target_name, current=None),
+            snapshot_ts=None, dry_run=dry_run,
+            errors=[f"unknown rice: {target_name!r}"], warnings=[],
+        )
+
+    # 2. Load state and identify current rice
+    state = read_state(roots)
+    current_m = next((m for m in all_manifests if m.meta.name == state.current_rice), None) if state.current_rice else None
+
+    # 3. Validate the target manifest
+    vres = validate_manifest(target_m, roots)
+    if not vres.ok:
+        errs = [f"validate({target_name}): {e}" for e in vres.errors]
+        return SwitchOutcome(
+            plan=SwitchPlan(target=target_name, current=state.current_rice),
+            snapshot_ts=None, dry_run=dry_run,
+            errors=errs, warnings=vres.warnings,
+        )
+    warnings.extend(vres.warnings)
+
+    # 4. If the same rice is requested, plan is a no-op (PLAN.md §3.2 #6)
+    if state.current_rice == target_name:
+        plan = compute_plan(current_m, target_m, all_manifests, {}, roots.config_home,
+                            active_identities=set())
+        return SwitchOutcome(plan=plan, snapshot_ts=None, dry_run=True,
+                            errors=[], warnings=warnings + ["no-op: already on this rice"])
+
+    # 5. Compute the plan
+    sym_state = current_symlinks_state(roots, _gather_config_links(target_m))
+    plan = compute_plan(
+        current_m, target_m, all_manifests,
+        sym_state, roots.config_home,
+    )
+
+    # 6. Dry-run: print and return
+    if dry_run:
+        logger.info("dry-run: %s", _print_plan(plan, roots))
+        return SwitchOutcome(plan=plan, snapshot_ts=None, dry_run=True,
+                            errors=[], warnings=warnings)
+
+    # 7. Acquire lock (5s timeout)
+    try:
+        with switch_lock(roots):
+            # 8. Capture pre-swap snapshot (pending -> commit on success)
+            config_links = _gather_config_links(target_m)
+            # Audit fix S4: record the rice name that was CURRENT
+            # before this switch. On rollback, we restore to that rice
+            # (the one whose state we just captured). The target name
+            # would be the WRONG choice because the snapshot contains
+            # the pre-swap state, which belongs to the current rice.
+            rollback_rice_name = state.current_rice or ""
+            ts, captured = create_pending(
+                roots, config_links, rice_name=rollback_rice_name,
+            )
+            logger.info("snapshot pending ts=%s captured=%d", ts, len(captured))
+            try:
+                # 9. Swap symlinks
+                for c in target_m.components:
+                    if c.config_link:
+                        n = os.path.abspath(os.path.expanduser(c.config_link))
+                        # Real execution: symlink to the rice dir.
+                        # For Slice 1 we still point the symlink at
+                        # the rice dir; this is the only filesystem
+                        # change we make. (See §11.1 for what we do
+                        # NOT do.)
+                        rice_dir = os.path.dirname(os.path.dirname(target_m.source_path))
+                        new_target = os.path.join(rice_dir, target_name,
+                                                  os.path.basename(n))
+                        swap_symlink(n, new_target)
+                # 10. Commit the pending snapshot
+                commit_snapshot(roots, ts)
+                # 11. Prune old snapshots (keep 5)
+                prune_snapshots(roots, keep=5)
+                # 12. Update state (current_rice + trust cache)
+                from .state import State as _State
+                st = read_state(roots)
+                st.current_rice = target_name
+                write_state(roots, st)
+                mark_trust(roots, target_name, target_m.source_sha256, status="ok")
+                # 13. Audit (Slice 2: JSON Lines dict event)
+                append_audit(roots, {
+                    "action": "switch",
+                    "from": state.current_rice or None,
+                    "to": target_name,
+                    "snapshot": ts,
+                    "plan": {
+                        "stop": len(plan.to_stop),
+                        "start": len(plan.to_start),
+                        "swap": len(plan.to_swap),
+                        "reload": len(plan.to_reload),
+                    },
+                })
+                logger.info("switched to %s (snapshot=%s)", target_name, ts)
+            except Exception as e:
+                # Rollback: restore from pending snapshot, then discard
+                # the pending. Re-create the symlinks the swap touched.
+                logger.error("switch failed: %s; rolling back", e)
+                # Restore each config_link from the pending snapshot.
+                from .snapshot import _copy_tree_symlinks
+                for cl in config_links:
+                    n = os.path.abspath(os.path.expanduser(cl))
+                    name = os.path.basename(n.rstrip("/")) or "config"
+                    src = os.path.join(roots.state_home, "rice-switcher",
+                                       "snapshot", f".pending-{ts}", name)
+                    if os.path.lexists(src):
+                        if os.path.lexists(n):
+                            if os.path.islink(n) or os.path.isfile(n):
+                                os.unlink(n)
+                            else:
+                                import shutil
+                                shutil.rmtree(n)
+                        _copy_tree_symlinks(src, n)
+                discard_pending(roots, ts)
+                mark_trust(roots, target_name, target_m.source_sha256, status="rolled_back")
+                errors.append(f"switch failed and rolled back: {e}")
+                return SwitchOutcome(plan=plan, snapshot_ts=None, dry_run=False,
+                                    errors=errors, warnings=warnings)
+    except LockError as e:
+        errors.append(f"lock error: {e}")
+        return SwitchOutcome(plan=plan, snapshot_ts=None, dry_run=False,
+                            errors=errors, warnings=warnings)
+
+    return SwitchOutcome(plan=plan, snapshot_ts=ts, dry_run=False,
+                        errors=[], warnings=warnings)
+
+
+def do_rollback(roots: Roots, ts: str | None = None, logger=None) -> tuple[str, list[str]]:
+    """Roll back to a specific (or the latest) committed snapshot."""
+    if logger is None:
+        logger = setup_logging(roots)
+    from .snapshot import list_committed, latest_snapshot_link
+    if ts is None:
+        # Use the latest symlink
+        if os.path.islink(latest_snapshot_link(roots)):
+            ts = os.readlink(latest_snapshot_link(roots))
+        else:
+            committed = list_committed(roots)
+            if not committed:
+                return "", ["no snapshot to roll back to"]
+            ts = committed[0]
+    errors: list[str] = []
+    try:
+        with switch_lock(roots):
+            restored, rice_name = restore_snapshot(roots, ts)
+            logger.info("rolled back to snapshot %s; restored %d paths", ts, len(restored))
+            # Audit fix S4: keep `state.current_rice` in sync with the
+            # rice that was actually restored. If the snapshot does
+            # not record a rice name (older snapshot, or a hand-edited
+            # `.captured.txt` with an invalid name), we report an
+            # explicit error rather than guess.
+            if rice_name:
+                st = read_state(roots)
+                st.current_rice = rice_name
+                write_state(roots, st)
+                logger.info("state.current_rice restored to %r", rice_name)
+            else:
+                errors.append(
+                    f"snapshot {ts} has no rice= line in .captured.txt; "
+                    "state.current_rice was NOT updated. Inspect and "
+                    "adjust manually if needed."
+                )
+            append_audit(roots, {
+                "action": "rollback",
+                "snapshot": ts,
+                "restored_count": len(restored),
+                "rice": rice_name or None,
+                "errors": errors,
+            })
+            return ts, errors
+    except LockError as e:
+        return "", [f"lock error: {e}"]
+    except FileNotFoundError as e:
+        return "", [str(e)]

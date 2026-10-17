@@ -1,0 +1,53 @@
+# Backup artifacts
+rice-backup/
+*.backup
+*.bak
+
+# Secrets and sensitive files
+*.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+id_*
+.ssh/
+.gnupg/
+secrets/
+credentials/
+
+# Cache and state
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+node_modules/
+dist/
+build/
+*.egg-info/
+
+# Tool state
+*.lock
+*.pid
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Matugen-generated (per PLAN.md §2b, §11.1)
+# These files are regenerated on every `rice-switcher switch` and
+# would otherwise be committed to the rice directory by accident.
+**/hyprland/colors.lua
+**/hyprlock/colors.conf
+**/fuzzel/fuzzel_theme.ini
+**/gtk-3.0/gtk.css
+**/illogical-impulse/config.json
+**/user/generated/colors.json
+**/user/generated/wallpaper/path.txt
+**/user/generated/terminal/sequences.txt
+**/user/generated/terminal/kitty-theme.conf
