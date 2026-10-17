@@ -1,6 +1,7 @@
 # Design — Onboarding TUI: clone, auto-manifest, gap detection
 
-**Status:** draft **revisi #2** — belum ada kode yang ditulis.
+**Status:** draft **revisi #2** — Prasyarat 0 (kill-by-identity) dan **Fase 1 (clone + naming)** sudah diimplementasikan & diuji; Fase 2–6 belum.
+**Status implementasi:** ✅ Prasyarat 0 (§12) — `process.py`/`lifecycle.py`/`managed_set.py`; ✅ Fase 1 clone + naming (§3, §9, §10) — `rice_switcher/clone.py`, subcommand `clone`, `tests/test_clone.py`; ⬜ Fase 2–6.
 **Cakupan:** alur "clone rice orang lain → bisa di-`switch`" menjadi semi-otomatis lewat TUI.
 **Dokumen terkait:** `docs/PLAN.md` (spec inti switch; §2c managed set, §2f `config_link`, §2g identitas proses, §2h keamanan, §4.1 skema manifest, §5.1 zero-dep, §6 roadmap), `README.md`.
 **Sifat:** dokumen desain. Tidak mengubah `docs/PLAN.md`; mekanisme inti switch tetap apa adanya — **kecuali** Prasyarat 0 (kill-by-identity, §12) yang menyentuh `process.py`/`lifecycle.py`.

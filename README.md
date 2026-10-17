@@ -184,6 +184,7 @@ All of the following are implemented.
 | `rice-switcher rollback [ts]` | Restore a snapshot (latest if omitted) and re-sync `state.json`. |
 | `rice-switcher apply [--require-session]` | Re-apply the rice recorded in `state.json`. Intended for `hl.on("hyprland.start", ...)`. Runs a real swap without the confirmation prompt. |
 | `rice-switcher import <path> [--name N] [--apply]` | Import an existing config directory as a new rice. Default dry-run; `--apply` copies. Read-only with respect to your live desktop. |
+| `rice-switcher clone <url> [--name N] [--depth D] [--branch B] [--allow-local] [--yes]` | Clone a third-party rice repo into `<RICE_HOME>/<name>` (name derived from the URL by default). Hardened: argv only (no shell), `--` before the URL, git protocol allowlist, no credential prompts. Writes `<name>/.rice-source.toml` provenance (URL redacted) and warns about symlinks that escape the rice dir. Does **not** create `rice.toml` or touch state. |
 | `rice-switcher diff <a> <b>` | Unified diff of two rices' `rice.toml`. Exit 0 same, 1 different, 2 error. |
 | `rice-switcher edit <name> [--editor CMD]` | Open `rice.toml` in `$EDITOR` (falls back to `$VISUAL`, then `vi`). |
 | `rice-switcher menu [--picker N] [--dry-run] [--require-session]` | Pick a rice with `fuzzel`/`rofi` and switch to it. |
@@ -434,6 +435,7 @@ These are designed in `docs/PLAN.md` but not implemented in the code:
 | **5. Lifecycle** | hooks, stop/start (identity-aware), `[theme]`, `hyprctl reload`, matugen, process rollback | Implemented |
 | **4. Sharing** | `import`, `diff`, `edit` | Implemented |
 | **4. Sharing (rest)** | `remove`, optional systemd integration | Not implemented |
+| **6. Onboarding** | `clone` + naming (Fase 1); auto-`rice.toml` draft, gap detection, TUI to follow | Fase 1 implemented |
 
 ### Autostart (Slice 3)
 
