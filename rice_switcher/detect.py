@@ -118,6 +118,7 @@ ENTRYPOINT_CANDIDATES = (
 _FIELD_ORDER = (
     "type", "executable", "argv_match", "exact_argv", "start", "stop",
     "start_check", "reload", "config_link", "depends_on", "optional", "timeout",
+    "started_by_config",
 )
 
 _SUSPICIOUS_CHARS = set(";&|`<>*?[]{}()\"'\\")
@@ -177,6 +178,9 @@ class DraftComponent:
     timeout: Field = field(default_factory=lambda: Field(10))
     optional: Field = field(default_factory=lambda: Field(False))
     source: str = ""
+    # Fase 4 (Opsi B): set by the review when the user (or `--yes`) chooses
+    # to let the rice's own config launch this component.
+    started_by_config: Field = field(default_factory=lambda: Field(False))
 
     def field_map(self) -> dict[str, Field]:
         return {k: getattr(self, k) for k in _FIELD_ORDER}
@@ -195,7 +199,7 @@ class DraftComponent:
         d: dict = {"name": self.name, "type": self.type.value}
         for key in ("executable", "argv_match", "exact_argv", "start",
                     "start_check", "reload", "config_link", "depends_on",
-                    "optional", "timeout"):
+                    "optional", "timeout", "started_by_config"):
             value = getattr(self, key).value
             if key == "timeout" and value == 10:
                 continue

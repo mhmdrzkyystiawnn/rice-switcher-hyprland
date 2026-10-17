@@ -905,6 +905,18 @@ def _generate_review(args, roots: Roots, rice: str, draft, log, *,
             for name, field_name in blocking:
                 print(f"  - {name}.{field_name}", file=sys.stderr)
             return 3
+        # Fase 4: `--yes` accepts a finding's default option (e.g. an `exec`
+        # conflict -> Opsi B). A finding with no safe default
+        # (`exec-once`/`hl.exec_cmd` conflict, or `needs_materialization`)
+        # is never decided silently: it blocks the save.
+        pending = session.apply_default_findings()
+        if pending:
+            print("error: --yes menolak menyimpan temuan yang belum "
+                  "ditangani; jalankan tanpa --yes untuk meninjau:",
+                  file=sys.stderr)
+            for f in pending:
+                print(f"  - {f.kind}: {f.title}", file=sys.stderr)
+            return 3
         return _persist_reviewed_draft(session, rice, roots, log)
 
     if out is None:

@@ -40,6 +40,7 @@ from .detect import (
     ManifestDraft,
 )
 from .manifest import VALID_TYPES, Component, Manifest, Meta
+from .gaps import AUTOSTART_CONFLICT, OPTION_CONFIG
 from .process import looks_like_dangerous_pkill
 from .validate import ValidationResult, _SESSION_EXECUTABLES, validate_manifest
 
@@ -150,6 +151,7 @@ def _to_component(dc: DraftComponent) -> Component:
         depends_on=list(dc.depends_on.value),
         optional=bool(dc.optional.value),
         timeout=timeout,
+        started_by_config=bool(dc.started_by_config.value),
     )
 
 
@@ -158,7 +160,7 @@ class ReviewSession:
 
     def __init__(self, draft: ManifestDraft):
         self.draft = draft
-        self._history: list[list[DraftComponent]] = []
+        self._history: list[tuple[list[DraftComponent], list]] = []
 
     # -- inspection --------------------------------------------------------
 
@@ -179,6 +181,16 @@ class ReviewSession:
 
     def findings(self) -> list:
         return list(self.draft.findings)
+
+    def finding(self, index: int):
+        """The finding at `index` (raises `ReviewError` when out of range)."""
+        if not isinstance(index, int) or index < 0 or index >= len(self.draft.findings):
+            raise ReviewError(f"tidak ada temuan nomor {index!r}")
+        return self.draft.findings[index]
+
+    def pending_findings(self) -> list:
+        """Findings the user/`--yes` has neither handled nor skipped."""
+        return [f for f in self.draft.findings if not f.is_resolved]
 
     def summary(self) -> list[ComponentView]:
         out: list[ComponentView] = []
@@ -204,12 +216,15 @@ class ReviewSession:
     # -- history -----------------------------------------------------------
 
     def _record(self) -> None:
-        self._history.append(copy.deepcopy(self.draft.components))
+        self._history.append((copy.deepcopy(self.draft.components),
+                              copy.deepcopy(self.draft.findings)))
 
     def undo(self) -> bool:
         if not self._history:
             return False
-        self.draft.components = self._history.pop()
+        comps, findings = self._history.pop()
+        self.draft.components = comps
+        self.draft.findings = findings
         return True
 
     # -- mutations ---------------------------------------------------------
@@ -291,6 +306,57 @@ class ReviewSession:
         comps.pop(idx)
         comps.insert(new, comp)
         self.draft.components = comps
+
+    # -- findings (Fase 4) -------------------------------------------------
+
+    def handle_finding(self, index: int, option: str | None = None) -> None:
+        """Resolve finding `index` with `option` (or its default).
+
+        `option="skip"` acknowledges without acting. For an
+        `autostart_conflict` the chosen option is also written back to the
+        component: `config` sets `started_by_config=true` (Opsi B) and
+        `switcher` clears it (Opsi C). Opsi A (`neutralise`) is reported as
+        unavailable and is intentionally not accepted here.
+        """
+        f = self.finding(index)
+        if option is None:
+            option = f.default_option
+            if not option:
+                raise ReviewError(
+                    "temuan ini tidak punya opsi default; pilih opsi "
+                    "eksplisit atau `skip`"
+                )
+        if option == "skip":
+            self._record()
+            f.decision = "skip"
+            return
+        if option not in f.options:
+            choices = ", ".join(f.options) if f.options else "tidak ada"
+            raise ReviewError(
+                f"opsi {option!r} tidak tersedia untuk temuan ini "
+                f"(pilihan: {choices}, atau skip)"
+            )
+        self._record()
+        f.decision = option
+        if f.kind == AUTOSTART_CONFLICT and f.component:
+            comp = self.component(f.component)
+            if comp is not None:
+                comp.started_by_config = Field(option == OPTION_CONFIG, CONF_AUTO)
+
+    def apply_default_findings(self) -> list:
+        """Resolve every finding that has a default option; return the rest.
+
+        This is what `generate --yes` means by "accept the defaults": an
+        `exec` conflict becomes Opsi B automatically, while an
+        `exec-once`/`hl.exec_cmd` conflict and a `needs_materialization`
+        warning (no default) stay pending and block the save.
+        """
+        for i, f in enumerate(self.draft.findings):
+            if f.is_resolved:
+                continue
+            if f.default_option:
+                self.handle_finding(i, f.default_option)
+        return self.pending_findings()
 
     # -- output ------------------------------------------------------------
 

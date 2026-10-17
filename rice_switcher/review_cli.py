@@ -26,7 +26,7 @@ AskFn = Callable[[str], str]
 OutFn = Callable[[str], None]
 
 _HELP = ("perintah: [Enter]=detail  e=edit  a=tambah  d=hapus  t=type  "
-         "u=undo  s=simpan  q=batal")
+         "c=temuan  u=undo  s=simpan  q=batal")
 
 _FIELD_HELP = ("field (name/start/executable/argv_match/exact_argv/stop/"
                "start_check): ")
@@ -67,10 +67,16 @@ def _parse_value(field_name: str, raw: str):
 def _print_summary(session: ReviewSession, out: OutFn) -> None:
     findings = session.findings()
     if findings:
-        out("Temuan:")
-        for f in findings:
+        out("Temuan (perintah `c` untuk menangani):")
+        for i, f in enumerate(findings):
             title = getattr(f, "title", None) or str(f)
-            out(f"  - {title}")
+            state = "selesai" if getattr(f, "is_resolved", False) else "belum ditangani"
+            out(f"  [{i}] {title} -- {state}")
+            opts = getattr(f, "options", None)
+            if opts is not None:
+                default = getattr(f, "default_option", "") or "tidak ada"
+                listed = ", ".join(opts) if opts else "tidak ada"
+                out(f"       opsi: {listed} | skip | default: {default}")
     review = session.needs_review()
     if review:
         out("Perlu ditinjau (guess/ask) -- wajib dilihat sebelum simpan:")
@@ -131,6 +137,39 @@ def _cmd_type(session: ReviewSession, ask: AskFn, out: OutFn) -> None:
     out(f"type {name} -> {new_type}")
 
 
+def _cmd_finding(session: ReviewSession, ask: AskFn, out: OutFn) -> None:
+    """Handle one Fase 4 finding: choose an option, its default, or skip."""
+    findings = session.findings()
+    if not findings:
+        out("tidak ada temuan.")
+        return
+    raw = ask("temuan nomor: ").strip()
+    try:
+        idx = int(raw)
+    except ValueError:
+        raise ReviewError(f"nomor temuan tidak valid: {raw!r}")
+    f = session.finding(idx)          # raises ReviewError if out of range
+    default = getattr(f, "default_option", "") or ""
+    opts = getattr(f, "options", []) or []
+    listed = ", ".join(opts) if opts else "tidak ada"
+    hint = f"opsi ({listed}; skip"
+    hint += f"; Enter=default {default}): " if default else "; Enter=tidak ada default): "
+    choice = ask(hint).strip()
+    if choice == "":
+        if not default:
+            raise ReviewError(
+                "temuan ini tidak punya opsi default; pilih opsi eksplisit "
+                "atau `skip`"
+            )
+        choice = default
+    if choice == "skip":
+        session.handle_finding(idx, "skip")
+        out(f"temuan {idx} di-skip.")
+    else:
+        session.handle_finding(idx, choice)
+        out(f"temuan {idx} -> {choice}")
+
+
 def run_review(session: ReviewSession, *, ask: AskFn, out: OutFn) -> ReviewOutcome:
     """Drive an interactive review of `session`.
 
@@ -168,6 +207,8 @@ def run_review(session: ReviewSession, *, ask: AskFn, out: OutFn) -> ReviewOutco
                 _cmd_delete(session, ask, out)
             elif cmd == "t":
                 _cmd_type(session, ask, out)
+            elif cmd == "c":
+                _cmd_finding(session, ask, out)
             else:
                 out(f"perintah tidak dikenal: {cmd!r}")
         except EOFError:

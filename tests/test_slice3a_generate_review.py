@@ -85,7 +85,9 @@ class GenerateReviewBase(unittest.TestCase):
 
 class YesPathTest(GenerateReviewBase):
     def test_yes_without_ask_saves(self):
-        self.mkrice("r", {"hypr/hyprland.conf": "exec-once = waybar\n"})
+        # `exec` conflicts have a default (Opsi B), so `--yes` applies it and
+        # still saves. (`exec-once`/`hl.exec_cmd` would block; see Fase 4.)
+        self.mkrice("r", {"hypr/hyprland.conf": "exec = waybar\n"})
         rc, out, err = self.run_cli("generate", "r", "--yes")
         self.assertEqual(rc, 0, out + err)
         mp = self.manifest_path("r")
@@ -95,9 +97,11 @@ class YesPathTest(GenerateReviewBase):
         names = [c["name"] for c in data["components"]]
         self.assertIn("hyprland", names)
         self.assertIn("waybar", names)
+        waybar = next(c for c in data["components"] if c["name"] == "waybar")
+        self.assertTrue(waybar["started_by_config"])
 
     def test_saved_manifest_round_trips_through_tomllib(self):
-        self.mkrice("r", {"hypr/hyprland.conf": "exec-once = waybar\n"})
+        self.mkrice("r", {"hypr/hyprland.conf": "exec = waybar\n"})
         rc, _, err = self.run_cli("generate", "r", "--yes")
         self.assertEqual(rc, 0, err)
         text = open(self.manifest_path("r")).read()
@@ -106,6 +110,7 @@ class YesPathTest(GenerateReviewBase):
         waybar = next(c for c in data["components"] if c["name"] == "waybar")
         self.assertTrue(waybar["exact_argv"])
         self.assertEqual(waybar["stop"], "")
+        self.assertTrue(waybar["started_by_config"])
 
     def test_yes_with_ask_stops_and_does_not_write(self):
         self.mkrice("r", {"hypr/hyprland.conf": "exec-once = qs -c $unknownCfg\n"})
@@ -138,14 +143,14 @@ class YesPathTest(GenerateReviewBase):
         self.assertIn("tidak ditulis", (out + err).lower())
 
     def test_meta_name_equals_folder_name(self):
-        self.mkrice("folder-name", {"hypr/hyprland.conf": "exec-once = waybar\n"})
+        self.mkrice("folder-name", {"hypr/hyprland.conf": "exec = waybar\n"})
         rc, _, err = self.run_cli("generate", "folder-name", "--yes")
         self.assertEqual(rc, 0, err)
         data = tomllib.loads(open(self.manifest_path("folder-name")).read())
         self.assertEqual(data["meta"]["name"], "folder-name")
 
     def test_refuses_to_overwrite_existing(self):
-        rice = self.mkrice("r", {"hypr/hyprland.conf": "exec-once = waybar\n"})
+        rice = self.mkrice("r", {"hypr/hyprland.conf": "exec = waybar\n"})
         mp = os.path.join(rice, "rice.toml")
         with open(mp, "w") as f:
             f.write("# original\n")
