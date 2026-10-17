@@ -80,6 +80,17 @@ KNOWN_BINARIES = {
     "fcitx5": ("fcitx5", "system"),
 }
 
+# Executable basename -> the subcommands that are one-shot *clients*, not
+# the daemon. `swww restore` / `swww img …` talk to an already-running
+# `swww-daemon`; using them to derive a managed component's process
+# identity is unreliable, so Langkah 0 marks those identities `ask`.
+KNOWN_CLIENT_SUBCOMMANDS = {
+    "swww": frozenset({"img", "restore", "clear", "kill", "query"}),
+    "awww": frozenset({"img", "restore", "clear", "kill", "query"}),
+}
+
+_CLIENT_NOTE = "perintah klien, mungkin bukan daemon"
+
 # Directory name -> (component name, type), for config-dir signals.
 DIR_SIGNALS = {
     "waybar": ("waybar", "bar"),
@@ -633,12 +644,12 @@ def _comp(name: str, ctype: str, exe: str, start: str, argv: list[str],
           argv_conf: str, config_link: str, link_conf: str,
           start_check: str, source: str, start_conf: str = CONF_AUTO,
           *, exact: bool = False,
-          exact_conf: str = CONF_AUTO) -> DraftComponent:
+          exact_conf: str = CONF_AUTO, argv_note: str = "") -> DraftComponent:
     return DraftComponent(
         name=name,
         type=Field(ctype, CONF_AUTO),
         executable=Field(exe, CONF_AUTO),
-        argv_match=Field(list(argv), argv_conf),
+        argv_match=Field(list(argv), argv_conf, argv_note),
         exact_argv=Field(bool(exact), exact_conf),
         start=Field(start, start_conf),
         stop=Field("", CONF_AUTO),
@@ -693,10 +704,19 @@ def _component_from_command(raw: str, ref: AutostartRef,
     argv_conf = CONF_AUTO if literal else CONF_ASK
     start_conf = CONF_ASK if unresolved else CONF_AUTO
     exact = literal and not argv
+    # Langkah 0: a known *client* subcommand (`swww restore`, `swww img …`)
+    # is a one-shot command against a daemon, not the daemon itself. Keep
+    # the argv for visibility but never let it pass as a confident identity.
+    argv_note = ""
+    client_subs = KNOWN_CLIENT_SUBCOMMANDS.get(exe)
+    if client_subs is not None and argv and argv[0] in client_subs:
+        argv_conf = CONF_ASK
+        argv_note = _CLIENT_NOTE
     start = " ".join(tokens)
     return _comp(name, ctype, exe, start, argv, argv_conf, "", CONF_AUTO,
                  _start_check_for(name), f"autostart:{ref.file}:{ref.line}",
-                 start_conf, exact=exact, exact_conf=CONF_AUTO)
+                 start_conf, exact=exact, exact_conf=CONF_AUTO,
+                 argv_note=argv_note)
 
 
 def _components_from_autostart(ref: AutostartRef,
