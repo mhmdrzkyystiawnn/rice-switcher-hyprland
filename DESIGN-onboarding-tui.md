@@ -2,8 +2,8 @@
 
 **Status:** draft **revisi #2** — belum ada kode yang ditulis.
 **Cakupan:** alur "clone rice orang lain → bisa di-`switch`" menjadi semi-otomatis lewat TUI.
-**Dokumen terkait:** `PLAN.md` (spec inti switch; §2c managed set, §2f `config_link`, §2g identitas proses, §2h keamanan, §4.1 skema manifest, §5.1 zero-dep, §6 roadmap), `README.md`.
-**Sifat:** dokumen desain. Tidak mengubah `PLAN.md`; mekanisme inti switch tetap apa adanya — **kecuali** Prasyarat 0 (kill-by-identity, §12) yang menyentuh `process.py`/`lifecycle.py`.
+**Dokumen terkait:** `docs/PLAN.md` (spec inti switch; §2c managed set, §2f `config_link`, §2g identitas proses, §2h keamanan, §4.1 skema manifest, §5.1 zero-dep, §6 roadmap), `README.md`.
+**Sifat:** dokumen desain. Tidak mengubah `docs/PLAN.md`; mekanisme inti switch tetap apa adanya — **kecuali** Prasyarat 0 (kill-by-identity, §12) yang menyentuh `process.py`/`lifecycle.py`.
 
 **Riwayat revisi**
 - **revisi #2** — menutup review keamanan & desain: (1) hardening argument injection saat clone, (2) larangan nama berawalan titik, (3) aturan containment symlink, (4) provenance di file terpisah + URL di-redact, (5) temuan baru **autostart bentrok**, (6) cleanup `.bak-*` via `lstat`+`unlink` (bukan `rmtree`), (7) tampilkan isi skrip sebelum approve. Plus **keputusan 7 pertanyaan terbuka** (§14) dan **Prasyarat 0: kill-by-identity** di core (§12). Urutan dibalik: fallback prompt dulu, `curses` terakhir (§5.1).
@@ -29,14 +29,14 @@ Dokumen ini merancang tepat sebatas batas itu: yang **BISA** dibuat penuh, dan y
 
 ## 1. Prinsip & batasan (hard constraints)
 
-1. **Zero runtime dependency (stdlib only).** `pyproject.toml:8-9` + `PLAN.md §5.1`. Karena itu:
+1. **Zero runtime dependency (stdlib only).** `pyproject.toml:8-9` + `docs/PLAN.md §5.1`. Karena itu:
    - TUI memakai **`curses`** (stdlib), **bukan** `textual`/`rich`/`prompt_toolkit`.
    - Serialisasi TOML ditulis sendiri (`tomllib` **read-only**, tidak bisa menulis). Lihat §4.5.
 2. **Review-first, bukan blind-auto.** Generator hanya menghasilkan **draft**. User melihat & mengedit di TUI sebelum disimpan. `validate` (`validate_manifest`), `switch` default **dry-run**, dan konfirmasi `yes` untuk rice hash baru tetap menjadi gerbang.
 3. **No RCE.** Tidak pernah menjalankan script pihak ketiga (`install.sh`, `*-profile.sh apply`, dsb.) secara otomatis. Setiap langkah berisiko harus **disetujui user per item** dan dicatat di audit. Tidak ada `eval`/`shell=True` atas input repo.
 4. **Tidak menyentuh live desktop** sampai user benar-benar menjalankan `switch`. Onboarding hanya menulis di `<RICE_HOME>` (+ `state.json` bila `adopt`).
 5. **Selalu ada jalur non-interaktif.** Setiap langkah TUI punya padanan flag (`--url`, `--name`, `--no-tui`, `--yes`, `--monitor`, `--keep-backups N`) agar bisa diuji hermetis dan dipakai dari skrip/keybind.
-6. **Audit** semua aksi (clone, generate, hook-approve, monitor-patch, cleanup) mengikuti `PLAN.md §2h`.
+6. **Audit** semua aksi (clone, generate, hook-approve, monitor-patch, cleanup) mengikuti `docs/PLAN.md §2h`.
 7. **Determinisme di tes.** Subprocess (`git`, `hyprctl`) injectable seperti pola `runner`/`probe`/`spawner` yang sudah ada.
 8. **Input repo asing tidak dipercaya (hardening).** URL ditolak bila diawali `-` (cegah argument injection); clone memakai separators `git clone -- <url> <dir>`; `GIT_TERMINAL_PROMPT=0` (repo privat tidak boleh hang menunggu kredensial); protokol dibatasi (blokir `ext::`). Tidak pernah mengikuti symlink yang `realpath`-nya keluar folder rice (containment). Detail: §3.2, §4.3, §10.
 9. **Tidak ada eksekusi/traversal buta.** Setiap langkah prasyarat pihak ketiga menampilkan isi skripnya (atau path + opsi buka pager) sebelum approve; tidak ada `rmtree` yang mengikuti symlink.
@@ -51,7 +51,7 @@ Dokumen ini merancang tepat sebatas batas itu: yang **BISA** dibuat penuh, dan y
 |---|---|
 | `rice_switcher/clone.py` | `derive_name(url)`, `do_clone(url, name, roots, *, runner, depth, branch)`. Pure-ish, injectable runner. |
 | `rice_switcher/detect.py` | Analisis direktori rice → `ManifestDraft` (komponen + `config_link` + catatan). Murni baca FS. |
-| `rice_switcher/tomlwrite.py` | Serializer TOML minimal untuk bentuk manifest (scalar → tabel → array-of-tables, sesuai `PLAN.md §4.1`). |
+| `rice_switcher/tomlwrite.py` | Serializer TOML minimal untuk bentuk manifest (scalar → tabel → array-of-tables, sesuai `docs/PLAN.md §4.1`). |
 | `rice_switcher/monitor.py` | `detect_monitors(hyprctl_json)` + `patch_monitor_lines(text, primary)`; injectable `hyprctl`. |
 | `rice_switcher/tui.py` | Layar `curses`: input, review/edit komponen, gap, preview plan, konfirmasi, cleanup. Tipis; logika di modul lain. |
 | `rice_switcher/onboard.py` | Orkestrator: clone → detect → review → gap → validate → (opsional) switch → cleanup. |
@@ -166,7 +166,7 @@ Contoh nyata (elifouts): `execs.lua:6 → hl.exec_cmd("qs -c $qsConfig")` + `var
 **⚠ Autostart bentrok (temuan baru — wajib, lihat §6.1).** Baris autostart itu **tetap ada** di config rice. Kalau detector menjadikannya komponen terkelola, `switch` akan **start** komponen itu, sementara `exec-once`/`exec` di config juga menjalankannya → **start ganda**, atau **saling bunuh** saat reload (`exec` jalan ulang tiap `hyprctl reload`; `exec-once` hanya sekali). Karena itu detector **wajib** memunculkan temuan "autostart bentrok" dengan dua opsi penanganan (§6.1) — **default Opsi B** ("dijalankan oleh config": switcher hanya stop) — **tidak** diam-diam membuat komponen start+stop.
 
 ### 4.2 Yang butuh keputusan / perhatian user
-- **`stop` → dikosongkan (keputusan #2).** Generator **tidak mengisi `stop`** dan **tidak menebak `pkill -x`**. `stop` kosong → `stop_component` memakai stop bawaan berbasis PID (identitas `executable` + `argv_match`, `PLAN.md §2g`). Ini bergantung pada **Prasyarat 0** (§12): kill-by-identity di `process.py`/`lifecycle.py`; tanpa itu `stop` kosong = jalankan `true` lalu **menunggu** → timeout (`lifecycle.py:119-136`). Kalau identitas ambigu → tandai `ask`, jangan mengarang `stop`.
+- **`stop` → dikosongkan (keputusan #2).** Generator **tidak mengisi `stop`** dan **tidak menebak `pkill -x`**. `stop` kosong → `stop_component` memakai stop bawaan berbasis PID (identitas `executable` + `argv_match`, `docs/PLAN.md §2g`). Ini bergantung pada **Prasyarat 0** (§12): kill-by-identity di `process.py`/`lifecycle.py`; tanpa itu `stop` kosong = jalankan `true` lalu **menunggu** → timeout (`lifecycle.py:119-136`). Kalau identitas ambigu → tandai `ask`, jangan mengarang `stop`.
 - `argv_match` bila ambigu (variabel tak teresolusi, quoting, beberapa instance).
 - `type` bila ambigu ("shell" vs "bar").
 - `name` komponen bila bentrok.
@@ -201,7 +201,7 @@ Dua bentuk repo:
 
 ### 4.5 `tomlwrite.py`
 - `tomllib` hanya baca → serializer minimal menulis: string, int, bool, array of string, tabel, array-of-tables.
-- Urutan key mengikuti `PLAN.md §4.1`: **scalar → tabel → array-of-tables**.
+- Urutan key mengikuti `docs/PLAN.md §4.1`: **scalar → tabel → array-of-tables**.
 - Tes: round-trip `tomllib.loads(tomlwrite(draft)) == draft` untuk ~15 manifest contoh (termasuk `fixtures/**`).
 
 ### 4.6 Acceptance (Fase 2)
@@ -215,7 +215,7 @@ Dua bentuk repo:
 
 ### 5.1 Teknologi & urutan pembangunan
 - **Prompt baris-per-baris dibangun LEBIH DULU; `curses` paling akhir** (urutan review #1). Jalur non-interaktif memang wajib (`--no-tui`/non-TTY), jadi TUI hanya pembungkus tipis di atasnya. Dengan ini Fase 1–2 (clone + detect + tomlwrite) sudah berguna tanpa menunggu TUI.
-- **`curses` (stdlib)** untuk TUI. Alasan: zero-dep (`PLAN.md §5.1`). Bila `stdout` bukan TTY atau `--no-tui` → pakai prompt baris-per-baris (`input()`) + `--yes` menerima default. Ini juga jalur tes.
+- **`curses` (stdlib)** untuk TUI. Alasan: zero-dep (`docs/PLAN.md §5.1`). Bila `stdout` bukan TTY atau `--no-tui` → pakai prompt baris-per-baris (`input()`) + `--yes` menerima default. Ini juga jalur tes.
 - **Single-window list + detail** sudah cukup (keputusan #3).
 
 ### 5.2 Layar
@@ -318,7 +318,7 @@ Dua bentuk repo:
 - **Containment symlink.** Tidak mengikuti symlink yang `realpath`-nya keluar folder rice — saat scan (`detect.py`), normalisasi layout, dan cleanup. Bandingkan `os.path.realpath(target)` dengan `os.path.realpath(rice_dir)` via `os.path.commonpath`; tolak bila di luar.
 - **Cleanup.** `.bak-*` dihapus dengan `lstat` + `unlink` (symlink) / `rmtree` (dir nyata non-symlink); tidak pernah mengikuti target (§7).
 - **Eksekusi prasyarat.** Hanya dengan approve eksplisit **setelah menampilkan isi skrip**; `runner` argv tanpa shell; audit. `[hooks].pre` yang ditambahkan otomatis ikut gerbang konfirmasi hash rice.
-- **Lintasan path** (`config_link`, lokasi swap) diverifikasi di bawah `roots` seperti mekanisme yang ada (`PLAN.md §2h`, `validate.py`).
+- **Lintasan path** (`config_link`, lokasi swap) diverifikasi di bawah `roots` seperti mekanisme yang ada (`docs/PLAN.md §2h`, `validate.py`).
 - **Redaksi URL** saat logging **dan** penyimpanan (hindari token) — audit & `.rice-source.toml`.
 - Tidak ada `eval`/`shell=True` atas isi repo.
 
@@ -370,7 +370,7 @@ Tiap fase: commit terpisah, suite hijau, **tanpa** mengubah live desktop.
 ## 14. Keputusan (dari review, revisi #2)
 
 1. **Layout** (§4.3): symlink relatif, **didaftarkan** di `<rice>/.git/info/exclude` agar repo clone bersih & `git pull` tak bentrok.
-2. **`stop` default** (§4.2): **dikosongkan**; switcher memakai stop bawaan berbasis PID (identitas `executable` + `argv_match`, `PLAN.md §2g`). Jangan menebak `pkill -x`; tandai `ask` bila ragu. Butuh Prasyarat 0.
+2. **`stop` default** (§4.2): **dikosongkan**; switcher memakai stop bawaan berbasis PID (identitas `executable` + `argv_match`, `docs/PLAN.md §2g`). Jangan menebak `pkill -x`; tandai `ask` bila ragu. Butuh Prasyarat 0.
 3. **TUI**: single-window list + detail; **dibuat paling akhir** (fallback prompt dulu).
 4. **Provenance**: file terpisah `.rice-source.toml` (di-exclude), URL di-redact.
 5. **`--switch`**: tawarkan **setelah** validate hijau **dan** plan dry-run ditampilkan; default **"N"**.

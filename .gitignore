@@ -53,4 +53,5 @@ Thumbs.db
 **/user/generated/terminal/kitty-theme.conf
 
 # Local planning notes (kept out of the repo)
-PLAN.md
+/PLAN.md
+/PLAN.local.md

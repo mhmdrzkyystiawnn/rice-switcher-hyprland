@@ -42,7 +42,7 @@ Hyprland has no built-in way to swap between whole desktop setups. If you keep s
 - **Snapshots & rollback:** the live `config_link` targets of the current rice are snapshotted before a swap. `rollback` restores them and re-syncs `state.json`.
 - **Dry-run by default:** `switch` and `import` change nothing unless you pass `--no-dry-run` / `--apply`.
 - **Pre-flight validation:** `switch` validates the target manifest first (schema, `config_link` conflicts and escape checks, missing `start`). Errors abort the switch; warnings are printed. `validate` runs a deeper check (binaries, Hyprland config, matugen templates).
-- **Process lifecycle:** `switch` runs hooks, stops/starts the managed components (verified by identity-aware probing), applies `[theme]`, reloads Hyprland, and regenerates colors with matugen (PLAN.md §3.2). `RICE_TEST=1` keeps it to the symlink swap.
+- **Process lifecycle:** `switch` runs hooks, stops/starts the managed components (verified by identity-aware probing), applies `[theme]`, reloads Hyprland, and regenerates colors with matugen (docs/PLAN.md §3.2). `RICE_TEST=1` keeps it to the symlink swap.
 - **Identity-aware process probing:** process identity is `(executable, argv_match)`, so `qs -c ii` and `qs -c minimal` are distinguished. Used by `status` to report running PIDs and by the lifecycle to decide whether a component is up.
 - **Lock file:** an `flock`-based lock with a 5-second timeout prevents concurrent switches.
 - **Audit log:** every real action appends one JSON Lines event, with sensitive values redacted.
@@ -324,7 +324,8 @@ rice-switcher-hyprland/
 │   ├── test_slice3_apply_menu.py
 │   ├── test_audit.py
 │   └── test_final_verify.py
-├── PLAN.md                 # full design document
+├── docs/
+│   └── PLAN.md             # public spec (design document)
 ├── LICENSE
 └── README.md
 ```
@@ -415,10 +416,10 @@ The suite covers managed-set computation, `config_link` conflict detection, proc
 
 ## Not yet implemented
 
-These are designed in `PLAN.md` but not implemented in the code:
+These are designed in `docs/PLAN.md` but not implemented in the code:
 
 - **`random`** and **`remove`** subcommands.
-- **systemd integration** for managed components (PLAN.md §5.2 chose direct subprocess instead).
+- **systemd integration** for managed components (docs/PLAN.md §5.2 chose direct subprocess instead).
 
 ---
 
