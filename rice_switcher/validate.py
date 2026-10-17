@@ -293,6 +293,14 @@ def validate_manifest(
         if c.type == "compositor":
             # PLAN.md §2c Aturan 1: explicit, just for documentation.
             pass
+        if c.started_by_config and c.type == "compositor":
+            # Fase 4 (Opsi B): the compositor is swapped and reloaded, not
+            # started by the switcher, so "started by config" is nonsense
+            # there and would silently exempt it from nothing.
+            res.errors.append(
+                f"component {c.name!r}: `started_by_config` is not allowed on "
+                f"a `compositor` (the switcher never starts or stops it)"
+            )
         if not c.start and not c.optional:
             res.errors.append(f"component {c.name!r}: `start` is required")
         if check_binaries and c.start and not c.optional and not _binary_present(c.start):

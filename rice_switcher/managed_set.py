@@ -52,6 +52,10 @@ class SwitchPlan:
                                                 # but listed; we still report them
                                                 # for visibility.
     notes: list[str] = field(default_factory=list)     # human-readable warnings
+    # Fase 4 (Opsi B): identities the target rice launches from its own
+    # config (`started_by_config`). The switcher never starts them, so
+    # they are reported here instead of `to_start` (DESIGN §6.1).
+    to_config: list[Identity] = field(default_factory=list)
 
     def is_noop(self) -> bool:
         return not (self.to_stop or self.to_start or self.to_reload or self.to_swap)
@@ -200,13 +204,21 @@ def compute_plan(
         plan.to_stop.append(ident)
 
     # 2. to_start: identities in target and NOT currently active.
-    #    Compositor exempt.
+    #    Compositor exempt. Fase 4 (Opsi B): a component the target rice
+    #    already launches from its own config (`started_by_config`) is
+    #    never started by the switcher -- it is reported in `to_config`
+    #    so a dry-run shows it honestly and cannot double-start it.
+    target_by_ident = {Identity.from_component(c): c for c in target_manifest.components}
     for ident in sorted(target_identities, key=str):
         if ident in active_identities:
             continue
         if ident.executable in SHARED_COMPONENT_NAMES:
             continue
         if ident in compositor_identities:
+            continue
+        tc = target_by_ident.get(ident)
+        if tc is not None and tc.started_by_config:
+            plan.to_config.append(ident)
             continue
         plan.to_start.append(ident)
 

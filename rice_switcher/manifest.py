@@ -39,6 +39,11 @@ class Component:
     optional: bool = False
     timeout: int = 10
     match: str = ""
+    # Fase 4 (Opsi B): the rice's own config launches this component
+    # (an `exec` line re-run on every reload), so the switcher must only
+    # *stop* it, never *start* it — otherwise it double-starts. Default
+    # False keeps every existing manifest unchanged (PLAN.md §2c/§2g).
+    started_by_config: bool = False
 
     def identity(self) -> tuple[str, tuple[str, ...]]:
         """Return the (executable, argv_match) tuple used for /proc matching.
@@ -132,6 +137,11 @@ def _coerce_component(raw: dict, idx: int) -> Component:
     timeout = raw.get("timeout", 10)
     if not isinstance(timeout, int) or timeout < 0:
         raise ManifestError(f"components[{idx}] (name={name!r}): timeout must be non-negative int")
+    started_by_config = raw.get("started_by_config", False)
+    if not isinstance(started_by_config, bool):
+        raise ManifestError(
+            f"components[{idx}] (name={name!r}): started_by_config must be bool"
+        )
     return Component(
         name=name,
         type=ctype,
@@ -149,6 +159,7 @@ def _coerce_component(raw: dict, idx: int) -> Component:
         optional=bool(raw.get("optional", False)),
         timeout=timeout,
         match=raw.get("match", ""),
+        started_by_config=started_by_config,
     )
 
 

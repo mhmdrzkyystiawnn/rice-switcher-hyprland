@@ -113,6 +113,9 @@ def _print_plan(plan: SwitchPlan, roots: Roots) -> str:
     lines.append(f"  to_swap ({len(plan.to_swap)}):")
     for p in plan.to_swap:
         lines.append(f"    @ {p}")
+    lines.append(f"  to_config ({len(plan.to_config)}):  # dijalankan oleh config rice")
+    for i in plan.to_config:
+        lines.append(f"    c {i}")
     for n in plan.notes:
         lines.append(f"  note: {n}")
     return "\n".join(lines)
