@@ -793,13 +793,143 @@ def _draft_to_toml(draft) -> str:
     return dump(data, comments=comments, header=header)
 
 
-def cmd_generate(args, roots: Roots, log) -> int:
-    """Fase 2: detect a cloned rice and draft its rice.toml.
+def _ask_fields(draft) -> list[tuple[str, str]]:
+    """[(component, field)] for every field the detector still `ask`s."""
+    from .detect import CONF_ASK
+    out: list[tuple[str, str]] = []
+    for c in draft.components:
+        for field_name, f in c.field_map().items():
+            if f.confidence == CONF_ASK:
+                out.append((c.name, field_name))
+    return out
 
-    Default prints the draft to stdout and writes nothing. `--write` writes
-    `<rice>/rice.toml` atomically (refusing to overwrite), applies layout
-    normalization, then validates the result and reports what still needs
-    review. The draft is never fully unattended: `ask`/`guess` fields are
+
+def _persist_reviewed_draft(session, rice, roots: Roots, log) -> int:
+    """Validate a reviewed draft, then write it with `tomlwrite`.
+
+    The manifest is serialised first and re-parsed, so exactly the text
+    that is written is the text that was validated. A validation *error*
+    aborts the write; warnings are shown but do not block. `[meta].name`
+    is forced to the rice folder name so the manifest can never disagree
+    with its directory.
+    """
+    import tomllib
+    from .detect import apply_layout_normalization
+    from .manifest import parse_manifest
+    from .validate import validate_manifest
+
+    folder = os.path.basename(os.path.normpath(rice))
+    if session.draft.name != folder:
+        print(f"note: [meta].name diset ke nama folder rice {folder!r}",
+              file=sys.stderr)
+        session.draft.name = folder
+
+    text = _draft_to_toml(session.draft)
+    try:
+        manifest = parse_manifest(tomllib.loads(text))
+    except Exception as e:
+        print(f"error: draf tidak bisa diserialisasi: {e}", file=sys.stderr)
+        return 1
+
+    vres = validate_manifest(manifest, roots)
+    for e in vres.errors:
+        print(f"  [E] {e}")
+    for w in vres.warnings:
+        print(f"  [W] {w}")
+
+    if vres.errors:
+        print("error: validasi gagal; rice.toml tidak ditulis", file=sys.stderr)
+        return 1
+
+    mp = os.path.join(rice, "rice.toml")
+    if os.path.exists(mp):
+        print(f"error: {mp} already exists; refusing to overwrite",
+              file=sys.stderr)
+        return 2
+
+    tmp = f"{mp}.tmp-{os.getpid()}"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, mp)
+    except OSError as e:
+        print(f"error: failed to write {mp}: {e}", file=sys.stderr)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return 1
+    print(f"wrote {mp}")
+
+    for r in apply_layout_normalization(session.draft, rice):
+        mark = "+" if r.created else "-"
+        print(f"  layout {mark} {r.name}: {r.detail}")
+
+    print(f"validation: {len(vres.errors)} error(s), {len(vres.warnings)} warning(s)")
+
+    from .log import append_audit
+    try:
+        append_audit(roots, {
+            "action": "generate",
+            "name": folder,
+            "path": mp,
+            "mode": "review",
+            "components": [c.name for c in session.draft.components],
+            "review": [f"{n}.{f}" for n, f in session.needs_review()],
+        })
+    except Exception:
+        # An audit failure must not block the operation.
+        pass
+    return 0
+
+
+def _generate_review(args, roots: Roots, rice: str, draft, log, *,
+                     ask=None, out=None) -> int:
+    """Fase 3a: review the draft, then save it (DESIGN §5).
+
+    `--yes` accepts the defaults without editing but refuses to save while
+    any `ask` field is unresolved. Otherwise the line-prompt driver runs
+    and saves only when the user asks to.
+    """
+    from .review import ReviewSession
+    from .review_cli import run_review
+
+    session = ReviewSession(draft)
+
+    if getattr(args, "yes", False):
+        blocking = _ask_fields(draft)
+        if blocking:
+            print("error: --yes menolak menyimpan field yang masih perlu "
+                  "keputusan (ask); jalankan tanpa --yes untuk meninjau:",
+                  file=sys.stderr)
+            for name, field_name in blocking:
+                print(f"  - {name}.{field_name}", file=sys.stderr)
+            return 3
+        return _persist_reviewed_draft(session, rice, roots, log)
+
+    if out is None:
+        out = print
+    if ask is None:
+        def ask(prompt):  # pragma: no cover - real terminal input
+            return input(prompt)
+
+    outcome = run_review(session, ask=ask, out=out)
+    if outcome.action != "save":
+        print(f"review dibatalkan ({outcome.reason}); tidak ada yang ditulis.",
+              file=sys.stderr)
+        return 1
+    return _persist_reviewed_draft(session, rice, roots, log)
+
+
+def cmd_generate(args, roots: Roots, log, *, ask=None, out=None) -> int:
+    """Fase 2/3a: detect a cloned rice and draft its rice.toml.
+
+    Default prints the draft to stdout and writes nothing. `--write`
+    writes it immediately (the pre-review path). `--yes` reviews the
+    defaults and saves only if no field is `ask`; `--no-tui` runs the
+    line-per-line review and saves on request. Every save path serialises
+    with `tomlwrite`, validates, and refuses to write on a validation
+    error. The draft is never fully unattended: `ask`/`guess` fields are
     surfaced as comments and in the report.
     """
     from .detect import apply_layout_normalization, detect
@@ -817,13 +947,19 @@ def cmd_generate(args, roots: Roots, log) -> int:
         return 2
 
     draft = detect(rice, roots=roots)
-    text = _draft_to_toml(draft)
 
     for note in draft.notes:
         print(f"note: {note}", file=sys.stderr)
     review = _draft_review_lines(draft)
     for line in review:
         print(f"review: {line}", file=sys.stderr)
+
+    # Fase 3a: review-and-save paths.
+    if not args.write and (getattr(args, "no_tui", False)
+                           or getattr(args, "yes", False)):
+        return _generate_review(args, roots, rice, draft, log, ask=ask, out=out)
+
+    text = _draft_to_toml(draft)
 
     if not args.write:
         sys.stdout.write(text)
@@ -1128,6 +1264,12 @@ def build_parser() -> argparse.ArgumentParser:
     gen.add_argument("--write", action="store_true", default=False,
                      help="write <rice>/rice.toml (refuses to overwrite) and "
                           "create the layout-normalization symlinks")
+    gen.add_argument("--no-tui", dest="no_tui", action="store_true",
+                     default=False,
+                     help="review the draft with line prompts, then save on `s`")
+    gen.add_argument("--yes", action="store_true", default=False,
+                     help="accept the draft defaults, but refuse to save while "
+                          "any field still needs a decision (ask)")
 
     df = sub.add_parser(
         "diff",
