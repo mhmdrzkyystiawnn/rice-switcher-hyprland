@@ -132,6 +132,38 @@ class CleanRealDirsTest(unittest.TestCase):
         self.assertFalse(os.path.lexists(d1), "oldest must be removed")
         self.assertTrue(os.path.isdir(d2), "newest must be kept")
 
+    # --- kasus campuran: symlink + dir + --keep 1 (regression Isu #1) ---
+
+    def test_mixed_keep_one_with_flag_keeps_newest(self):
+        """--keep 1 --include-real-dirs: symlink tertua + dir terbaru.
+        Yang tersisa = 1 terbaru (dir), symlink tertua dihapus."""
+        s_old = self._mk_symlink_backup("20230101T000000_000")
+        d_new = self._mk_dir_backup("20230102T000000_000")  # newer
+        rc, out = self._run(["clean-backups", "--keep", "1", "--yes",
+                             "--include-real-dirs"])
+        self.assertEqual(rc, 0, f"out={out!r}")
+        self.assertFalse(os.path.lexists(s_old),
+                         "oldest symlink must be removed")
+        self.assertTrue(os.path.isdir(d_new),
+                        "newest dir must be kept (global retention)")
+
+    def test_mixed_keep_one_without_flag_protects_dir(self):
+        """--keep 1 --yes tanpa flag: 1 symlink eligible, 1 dir dilindungi.
+        Symlink disisakan (--keep 1), dir disisakan (dilindungi). Exit
+        non-nol karena ada dir yang dilewati."""
+        s_old = self._mk_symlink_backup("20230101T000000_000")
+        d_new = self._mk_dir_backup("20230102T000000_000")
+        rc, out = self._run(["clean-backups", "--keep", "1", "--yes"])
+        self.assertNotEqual(rc, 0, f"expected non-zero; out={out!r}")
+        # Both survive: symlink retained by --keep 1, dir retained by --include-real-dirs
+        self.assertTrue(os.path.lexists(s_old),
+                        "symlink retained by --keep 1")
+        self.assertTrue(os.path.isdir(d_new),
+                        "dir protected without --include-real-dirs")
+        # Both reported in output
+        self.assertIn("[simpan]", out, f"symlink must be marked simpan: {out!r}")
+        self.assertIn("[dilewati]", out, f"dir must be marked dilewati: {out!r}")
+
     # --- interaktif: prompt terpisah untuk dir nyata ----------------------
 
     def test_interactive_asks_for_real_dir(self):

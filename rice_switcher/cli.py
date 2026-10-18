@@ -661,6 +661,10 @@ def cmd_clean_backups(args, roots: Roots, log, *, ask=None, out=None) -> int:
     symlink_entries = [b for b in entries if b.kind == "symlink"]
     dir_entries = [b for b in entries if b.kind == "dir"]
     eligible = symlink_entries + (dir_entries if include_real_dirs else [])
+    # Re-sort by ts (newest first) so plan_cleanup applies global retention
+    # correctly. Without this, symlinks all sort first and dirs all sort
+    # second, breaking --keep N for mixed symlink+dir backups.
+    eligible.sort(key=lambda b: b.ts, reverse=True)
 
     to_remove = plan_cleanup(eligible, keep)
     remove_paths = {b.path for b in to_remove}
