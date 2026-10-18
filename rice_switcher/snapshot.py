@@ -401,17 +401,30 @@ def current_symlinks_state(roots: Roots, config_link_paths: Iterable[str]) -> di
     return out
 
 
-def swap_symlink(target: str, source: str) -> None:
+def swap_symlink(target: str, source: str, roots=None) -> str | None:
     """Atomically replace the symlink at `target` with a new symlink to
     `source`. The previous target is preserved as `<target>.bak-<ts>`.
+
+    Returns the backup path if a backup was created, else None.
+    When `roots` is provided, an audit event is recorded.
     """
     if not os.path.lexists(target):
         # No existing target: just create the symlink.
         os.symlink(source, target)
-        return
+        if roots is not None:
+            from .log import append_audit
+            append_audit(roots, {
+                "action": "swap_symlink",
+                "link": target,
+                "old_target": None,
+                "new_target": source,
+                "backup": None,
+            })
+        return None
     # Back up the existing entry. Use a timestamp suffix.
     ts = _now_ts()
     backup = f"{target}.bak-{ts}"
+    old_target = os.readlink(target) if os.path.islink(target) else None
     os.rename(target, backup)
     try:
         os.symlink(source, target)
@@ -419,13 +432,23 @@ def swap_symlink(target: str, source: str) -> None:
         # If the new symlink fails, restore the backup.
         os.rename(backup, target)
         raise
+    if roots is not None:
+        from .log import append_audit
+        append_audit(roots, {
+            "action": "swap_symlink",
+            "link": target,
+            "old_target": old_target,
+            "new_target": source,
+            "backup": backup,
+        })
+    return backup
 
 
-def undo_swap(target: str) -> bool:
+def undo_swap(target: str, roots=None) -> str | None:
     """Undo a previous `swap_symlink(target, ...)`: remove the symlink
     at `target` and rename the `.bak-<ts>` back if present. Returns
-    True if a rollback was performed, False if there was nothing to
-    undo.
+    the backup path that was restored, or None if there was nothing to
+    undo. When `roots` is provided, an audit event is recorded.
     """
     parent = os.path.dirname(target)
     base = os.path.basename(target)
@@ -435,13 +458,23 @@ def undo_swap(target: str) -> bool:
             if entry.startswith(f"{base}.bak-"):
                 backups.append(entry)
     except FileNotFoundError:
-        return False
+        return None
     if not backups:
-        return False
+        return None
     # Pick the most recent backup (lexicographic == chronological for ts).
     backups.sort(reverse=True)
     chosen = os.path.join(parent, backups[0])
+    old_target = os.readlink(target) if os.path.islink(target) else None
     if os.path.lexists(target):
         os.unlink(target)
     os.rename(chosen, target)
-    return True
+    if roots is not None:
+        from .log import append_audit
+        append_audit(roots, {
+            "action": "undo_swap",
+            "link": target,
+            "old_target": old_target,
+            "new_target": target,
+            "backup": chosen,
+        })
+    return chosen

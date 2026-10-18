@@ -285,7 +285,7 @@ def do_switch(
                         rice_dir = os.path.dirname(os.path.dirname(target_m.source_path))
                         new_target = os.path.join(rice_dir, target_name,
                                                   os.path.basename(n))
-                        swap_symlink(n, new_target)
+                        backup = swap_symlink(n, new_target, roots=roots)
 
                 # Lifecycle (PLAN.md §3.2 #9-#12): verify, reload,
                 # matugen, start, post-hooks.
@@ -369,7 +369,7 @@ def do_switch(
                 from .snapshot import _copy_tree_symlinks, undo_swap
                 for cl in config_links:
                     n = os.path.abspath(os.path.expanduser(cl))
-                    if undo_swap(n):
+                    if undo_swap(n, roots=roots):
                         continue
                     name = os.path.basename(n.rstrip("/")) or "config"
                     src = os.path.join(roots.state_home, "rice-switcher",

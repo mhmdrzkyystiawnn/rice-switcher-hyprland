@@ -407,48 +407,223 @@ from unittest import mock
 # ---------------------------------------------------------------------------
 
 class FooterRenderingTest(unittest.TestCase):
-    """`cmd_switch` no longer renders the misleading `dry_run=` literal.
+    """`cmd_switch` footer now labels all three execution paths distinctly.
 
-    The `dry_run` field on `SwitchOutcome` is the INTERNAL semantic
-    ("did a filesystem change happen?"). Showing it as `dry_run=True`
-    in the footer misled users who passed `--no-dry-run`. The footer
-    now uses `no_op=` to make the meaning explicit.
+    Three paths:
+    - no-op:    current_rice == target_name.  mode=no-op     executed=False
+    - dry-run:  CLI --dry-run (default).       mode=dry-run   executed=False
+    - real:     CLI --no-dry-run and a real    mode=real      executed=True
+                filesystem change happens.
     """
 
     def setUp(self):
         self._td = tempfile.TemporaryDirectory(prefix="rs-6-footer-")
         self.roots = _make_roots(self._td.name)
+        # RICE_TEST=1 keeps manage_processes off (no real kill/start)
+        self._env = mock.patch.dict(os.environ, {"RICE_TEST": "1"}, clear=False)
+        self._env.start()
+        # Two rices: end4 (no config_link) for no-op, elifouts (with
+        # config_link) for dry-run and real paths.
         _write_manifest(os.path.join(self.roots.rice_home, "end4", "rice.toml"),
                         END4_TOML)
-        write_state(self.roots, State(current_rice="end4", last_switch=0.0))
-        # Pre-trust the rice so the confirmation prompt doesn't abort.
+        self.live_hypr = os.path.join(self.roots.config_home, "hypr")
+        self.live_waybar = os.path.join(self.roots.config_home, "waybar")
+        _write_manifest(
+            os.path.join(self.roots.rice_home, "elifouts", "rice.toml"),
+            ELIFOUTS_TOML_TEMPLATE.format(
+                rice_name="elifouts",
+                config_link=self.live_hypr,
+                waybar_link=self.live_waybar,
+            ),
+        )
+        elifouts_hypr = os.path.join(self.roots.rice_home, "elifouts", "hypr")
+        elifouts_waybar = os.path.join(self.roots.rice_home, "elifouts", "waybar")
+        for d in (elifouts_hypr, elifouts_waybar):
+            os.makedirs(d, exist_ok=True)
+        write_state(self.roots, State(current_rice="elifouts", last_switch=0.0))
+        os.symlink(elifouts_hypr, self.live_hypr)
+        os.symlink(elifouts_waybar, self.live_waybar)
+        # Pre-trust both rices so confirmation doesn't block.
         from rice_switcher.state import mark_trust
-        m = load_manifest(os.path.join(self.roots.rice_home, "end4", "rice.toml"))
-        mark_trust(self.roots, "end4", m.source_sha256, status="ok")
+        m_end4 = load_manifest(os.path.join(self.roots.rice_home, "end4", "rice.toml"))
+        m_elif = load_manifest(os.path.join(self.roots.rice_home, "elifouts", "rice.toml"))
+        mark_trust(self.roots, "end4", m_end4.source_sha256, status="ok")
+        mark_trust(self.roots, "elifouts", m_elif.source_sha256, status="ok")
+
+    def tearDown(self):
+        self._env.stop()
+        self._td.cleanup()
 
     def tearDown(self):
         self._td.cleanup()
 
-    def _run_cmd(self, no_dry_run: bool) -> str:
+    def _run_cmd(self, name: str, no_dry_run: bool) -> str:
         from argparse import Namespace
-        args = Namespace(name="end4", no_dry_run=no_dry_run, cmd="switch")
+        args = Namespace(name=name, no_dry_run=no_dry_run, cmd="switch")
         so, se = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(so), contextlib.redirect_stderr(se):
             rc = cmd_switch(args, self.roots, log=None)
         return so.getvalue() + se.getvalue()
 
-    def test_footer_does_not_show_dry_run_literal(self):
-        out = self._run_cmd(no_dry_run=True)
+    # ---- no-op path -----------------------------------------------------
+    def test_footer_noop_path(self):
+        # Set current=end4 so target=end4 is a true no-op.
+        write_state(self.roots, State(current_rice="end4", last_switch=0.0))
+        from rice_switcher.state import mark_trust
+        m = load_manifest(os.path.join(self.roots.rice_home, "end4", "rice.toml"))
+        mark_trust(self.roots, "end4", m.source_sha256, status="ok")
+        out = self._run_cmd("end4", no_dry_run=True)
+        self.assertIn("mode=no-op", out,
+                      f"no-op path should show mode=no-op:\n{out}")
         self.assertNotIn("dry_run=", out,
-                         f"footer still renders the misleading `dry_run=` literal:\n{out}")
+                         f"footer must not contain misleading dry_run= literal:\n{out}")
 
-    def test_footer_shows_no_op_label_for_noop(self):
-        out = self._run_cmd(no_dry_run=True)
-        # For a no-op (current=end4, target=end4) with --no-dry-run, the
-        # internal `dry_run` field is True (no filesystem change). The
-        # new label should be `no_op=True`.
-        self.assertIn("no_op=True", out,
-                      f"footer should show no_op=True for the no-op case:\n{out}")
+    def test_footer_noop_does_not_pretend_real(self):
+        write_state(self.roots, State(current_rice="end4", last_switch=0.0))
+        from rice_switcher.state import mark_trust
+        m = load_manifest(os.path.join(self.roots.rice_home, "end4", "rice.toml"))
+        mark_trust(self.roots, "end4", m.source_sha256, status="ok")
+        out = self._run_cmd("end4", no_dry_run=True)
+        self.assertNotIn("mode=real", out,
+                         f"no-op must not claim mode=real:\n{out}")
+
+    # ---- dry-run path ---------------------------------------------------
+    def test_footer_dry_run_path(self):
+        # current=elifouts, target=end4, --dry-run (default)
+        out = self._run_cmd("end4", no_dry_run=False)
+        self.assertIn("mode=dry-run", out,
+                      f"dry-run path should show mode=dry-run:\n{out}")
+        self.assertNotIn("mode=real", out,
+                         f"dry-run must not claim mode=real:\n{out}")
+
+    # ---- real path ------------------------------------------------------
+    def test_footer_real_path(self):
+        # current=elifouts, target=end4, --no-dry-run: real but no swap
+        # (end4 has no config_link). Footer should still show mode=real
+        # because state changed and a snapshot was taken.
+        # Earlier no-op tests set state=end4; reset back to elifouts and
+        # re-trust both (write_state wipes trust).
+        write_state(self.roots, State(current_rice="elifouts", last_switch=0.0))
+        from rice_switcher.state import mark_trust
+        m_end4 = load_manifest(os.path.join(self.roots.rice_home, "end4", "rice.toml"))
+        m_elif = load_manifest(os.path.join(self.roots.rice_home, "elifouts", "rice.toml"))
+        mark_trust(self.roots, "end4", m_end4.source_sha256, status="ok")
+        mark_trust(self.roots, "elifouts", m_elif.source_sha256, status="ok")
+        out = self._run_cmd("end4", no_dry_run=True)
+        self.assertIn("mode=real", out,
+                      f"real path should show mode=real:\n{out}")
+        self.assertIn("snapshot=20", out,
+                      f"real path should record a snapshot:\n{out}")
+
+
+class AuditSwapSymlinkTest(unittest.TestCase):
+    """Audit events for swap_symlink and undo_swap.
+
+    Every real swap records {"action":"swap_symlink", "link":...,
+    "old_target":..., "new_target":..., "backup":...}. undo_swap records
+    {"action":"undo_swap", ...}. Dry-run records NEITHER. Audit entries
+    contain paths only, never file contents.
+    """
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory(prefix="rs-6-audit-swap-")
+        self.roots = _make_roots(self._td.name)
+        _write_manifest(os.path.join(self.roots.rice_home, "end4", "rice.toml"),
+                        END4_TOML)
+        self.live_hypr = os.path.join(self.roots.config_home, "hypr")
+        self.live_waybar = os.path.join(self.roots.config_home, "waybar")
+        _write_manifest(
+            os.path.join(self.roots.rice_home, "elifouts", "rice.toml"),
+            ELIFOUTS_TOML_TEMPLATE.format(
+                rice_name="elifouts",
+                config_link=self.live_hypr,
+                waybar_link=self.live_waybar,
+            ),
+        )
+        elifouts_hypr = os.path.join(self.roots.rice_home, "elifouts", "hypr")
+        elifouts_waybar = os.path.join(self.roots.rice_home, "elifouts", "waybar")
+        for d in (elifouts_hypr, elifouts_waybar):
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "f.txt"), "w") as f:
+                f.write("v_elifouts\n")
+        write_state(self.roots, State(current_rice="elifouts", last_switch=0.0))
+        os.symlink(elifouts_hypr, self.live_hypr)
+        os.symlink(elifouts_waybar, self.live_waybar)
+        from rice_switcher.state import mark_trust
+        m_elif = load_manifest(os.path.join(self.roots.rice_home, "elifouts", "rice.toml"))
+        mark_trust(self.roots, "elifouts", m_elif.source_sha256, status="ok")
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def _audit_events(self):
+        from rice_switcher.paths import audit_log_file
+        path = audit_log_file(self.roots)
+        if not os.path.isfile(path):
+            return []
+        events = []
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    events.append(json.loads(line))
+        return events
+
+    def test_swap_symlink_recorded_in_audit(self):
+        # Re-set state to end4 so switch TO elifouts triggers swap
+        # (elifouts has config_link -> swap_symlink is called).
+        write_state(self.roots, State(current_rice="end4", last_switch=0.0))
+        m_end4 = load_manifest(os.path.join(self.roots.rice_home, "end4", "rice.toml"))
+        m_elif = load_manifest(os.path.join(self.roots.rice_home, "elifouts", "rice.toml"))
+        do_switch(
+            self.roots, "elifouts", [m_end4, m_elif],
+            dry_run=False, force_real=True, manage_processes=False, logger=None,
+        )
+        events = [e for e in self._audit_events()
+                  if e.get("action") == "swap_symlink"]
+        self.assertGreaterEqual(len(events), 1,
+                         f"expected >=1 swap_symlink audit event; got {events}")
+        for ev in events:
+            self.assertIn("link", ev)
+            self.assertIn("old_target", ev)
+            self.assertIn("new_target", ev)
+            self.assertIn("backup", ev)
+            # Paths only, never file contents.
+            self.assertNotIn("v_elifouts", json.dumps(ev),
+                             "audit must not leak file contents")
+
+    def test_dry_run_does_not_record_swap_symlink(self):
+        m_end4 = load_manifest(os.path.join(self.roots.rice_home, "end4", "rice.toml"))
+        m_elif = load_manifest(os.path.join(self.roots.rice_home, "elifouts", "rice.toml"))
+        do_switch(
+            self.roots, "end4", [m_end4, m_elif],
+            dry_run=True, force_real=False, manage_processes=False, logger=None,
+        )
+        events = [e for e in self._audit_events()
+                  if e.get("action") == "swap_symlink"]
+        self.assertEqual(events, [],
+                         f"dry-run must not record swap_symlink; got {events}")
+
+    def test_undo_swap_recorded_in_audit(self):
+        # Build: live symlink to a/hypr, swap to b/hypr (creates .bak-*),
+        # then undo_swap restores from .bak-* and records audit.
+        from rice_switcher.snapshot import swap_symlink, undo_swap
+        for r in ("a", "b"):
+            d = os.path.join(self.roots.rice_home, r, "hypr")
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "f.txt"), "w") as f:
+                f.write(f"v_{r}\n")
+        live = os.path.join(self.roots.config_home, "hypr")
+        if os.path.lexists(live) or os.path.islink(live):
+            os.unlink(live)
+        os.symlink(os.path.join(self.roots.rice_home, "a", "hypr"), live)
+        swap_symlink(live, os.path.join(self.roots.rice_home, "b", "hypr"),
+                     roots=self.roots)
+        undo_swap(live, roots=self.roots)
+        events = [e for e in self._audit_events()
+                  if e.get("action") == "undo_swap"]
+        self.assertEqual(len(events), 1,
+                         f"expected 1 undo_swap audit event; got {events}")
 
 
 if __name__ == "__main__":

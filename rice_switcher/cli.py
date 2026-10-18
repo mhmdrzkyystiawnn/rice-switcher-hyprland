@@ -528,9 +528,25 @@ def cmd_switch(args, roots: Roots, log) -> int:
         force_real=args.no_dry_run,
         logger=log,
     )
+    # Footer labels the three execution paths distinctly:
+    #   no-op:    current_rice == target_name.  outcome.dry_run=True,
+    #             and the user did NOT pass --dry-run (so we asked for
+    #             a real run, but the plan was empty).
+    #   dry-run:  user did not pass --no-dry-run.  outcome.dry_run=True.
+    #   real:     outcome.dry_run=False (a real execution happened,
+    #             even if no swap was needed).
+    is_noop = (outcome.dry_run
+               and not dry_run
+               and outcome.plan.current == outcome.plan.target)
+    if is_noop:
+        mode = "no-op"
+    elif outcome.dry_run:
+        mode = "dry-run"
+    else:
+        mode = "real"
     print(textwrap.dedent(f"""
         {plan_str(outcome.plan, roots)}
-        no_op={outcome.dry_run}  snapshot={outcome.snapshot_ts}
+        mode={mode}  snapshot={outcome.snapshot_ts}
         errors={outcome.errors}  warnings={outcome.warnings}
     """).strip())
     if outcome.errors:
