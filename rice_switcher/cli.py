@@ -646,27 +646,49 @@ def cmd_clean_backups(args, roots: Roots, log, *, ask=None, out=None) -> int:
         print("error: --keep harus integer >= 0", file=sys.stderr)
         return 2
 
+    include_real_dirs = getattr(args, "include_real_dirs", False)
+
     cfg = roots.config_home
     entries = list_backups(cfg)
     if not entries:
         out("tidak ada backup .bak-* untuk dibersihkan.")
         return 0
 
-    to_remove = plan_cleanup(entries, keep)
+    # Partition: symlink backups are always eligible; real directories are
+    # protected unless --include-real-dirs is given (they are never removed
+    # by --keep 0 alone). Retention (--keep) is computed GLOBALLY across
+    # all eligible entries so the N newest overall survive.
+    symlink_entries = [b for b in entries if b.kind == "symlink"]
+    dir_entries = [b for b in entries if b.kind == "dir"]
+    eligible = symlink_entries + (dir_entries if include_real_dirs else [])
+
+    to_remove = plan_cleanup(eligible, keep)
     remove_paths = {b.path for b in to_remove}
-    kept_n = len(entries) - len(to_remove)
+    # skipped_dirs only counts protected dirs (no --include-real-dirs).
+    # Dirs retained by --keep are "simpan", not skipped.
+    skipped_dirs = ([] if include_real_dirs
+                    else [b for b in dir_entries if b.path not in remove_paths])
+    kept_n = len(entries) - len(to_remove) - len(skipped_dirs)
 
     out(f"backup .bak-* ditemukan: {len(entries)} (config_home={cfg})")
     for b in entries:
-        mark = "hapus" if b.path in remove_paths else "simpan"
+        if b.path in remove_paths:
+            mark = "hapus"
+        elif b in skipped_dirs:
+            mark = "dilewati"
+        else:
+            mark = "simpan"
         out(f"  [{mark}] {b.path}  ({b.kind})")
     out(_CLEAN_BACKUPS_CONSEQUENCE)
+    if not include_real_dirs and dir_entries:
+        out("backup direktori nyata dilindungi; gunakan --include-real-dirs untuk menghapusnya.")
 
-    if not to_remove:
+    if not to_remove and not skipped_dirs:
         out("tidak ada yang dihapus (retensi --keep menyisakan semuanya).")
         return 0
 
-    # Refuse while a switch/rollback is in progress.
+    # Refuse while a switch/rollback is in progress (check BEFORE any
+    # prompt so a busy lock is always reported).
     try:
         with switch_lock(roots, timeout_seconds=0.0):
             pass
@@ -674,6 +696,23 @@ def cmd_clean_backups(args, roots: Roots, log, *, ask=None, out=None) -> int:
         print(f"error: switch sedang berlangsung; tidak menghapus apa pun "
               f"({e})", file=sys.stderr)
         return 1
+
+    if not to_remove:
+        # Only skipped dirs: --yes reports them and exits non-zero;
+        # interactive users still get a chance to cancel.
+        if not getattr(args, "yes", False) and skipped_dirs:
+            try:
+                answer = ask(f"{len(skipped_dirs)} direktori nyata dilindungi; "
+                             f"lanjut? [y/N]: ")
+            except EOFError:
+                out("input berakhir (EOF); dibatalkan tanpa menghapus.")
+                return 0
+            if answer.strip().lower() not in ("y", "yes"):
+                out("dibatalkan tanpa menghapus.")
+                return 0
+        else:
+            out(f"tidak ada yang dihapus; {len(skipped_dirs)} direktori nyata dilewati.")
+            return 1
 
     if not getattr(args, "yes", False):
         try:
@@ -715,7 +754,11 @@ def cmd_clean_backups(args, roots: Roots, log, *, ask=None, out=None) -> int:
     for f in failed:
         print(f"error: gagal menghapus {f['path']}: {f['error']}",
               file=sys.stderr)
-    return 1 if failed else 0
+    if failed:
+        return 1
+    if skipped_dirs:
+        return 1
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -1453,6 +1496,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="keep the N newest backups (default: remove all)")
     cb.add_argument("--yes", action="store_true", default=False,
                     help="skip the confirmation prompt")
+    cb.add_argument("--include-real-dirs", dest="include_real_dirs",
+                    action="store_true", default=False,
+                    help="also remove .bak-* entries that are real directories "
+                         "(default: they are protected and only reported)")
 
     return p
 

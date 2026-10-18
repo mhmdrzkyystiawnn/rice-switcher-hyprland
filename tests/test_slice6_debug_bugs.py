@@ -374,7 +374,7 @@ class RealDirBackupTest(unittest.TestCase):
         # The backup preserves the original file.
         self.assertTrue(os.path.isfile(os.path.join(backups[0].path, "pre.conf")))
 
-    def test_clean_backups_keep_zero_yes_removes_real_dir(self):
+    def test_clean_backups_real_dir_protected_by_default(self):
         m_a = load_manifest(os.path.join(self.roots.rice_home, "a", "rice.toml"))
         m_b = load_manifest(os.path.join(self.roots.rice_home, "b", "rice.toml"))
         do_switch(
@@ -384,18 +384,27 @@ class RealDirBackupTest(unittest.TestCase):
         backups = list_backups(self.roots.config_home)
         self.assertEqual(len(backups), 1)
         backup_path = backups[0].path
-        # Run clean-backups --keep 0 --yes directly (no interactive ask).
+        self.assertEqual(backups[0].kind, "dir")
+        # Default: real dirs are protected, exit non-zero (skipped).
         from rice_switcher.cli import build_parser
         args = build_parser().parse_args(["clean-backups", "--keep", "0", "--yes"])
-        # Stub ask/out for hermetic CLI.
         with mock.patch("rice_switcher.log.append_audit"):
             so, se = io.StringIO(), io.StringIO()
             with contextlib.redirect_stdout(so), contextlib.redirect_stderr(se):
                 rc = cmd_clean_backups(args, self.roots, None)
-        self.assertEqual(rc, 0, f"clean-backups --keep 0 --yes must succeed; got rc={rc}, "
-                                f"out={so.getvalue()!r} err={se.getvalue()!r}")
+        self.assertNotEqual(rc, 0, "expected non-zero exit when real dir skipped")
+        self.assertTrue(os.path.isdir(backup_path),
+                        "real dir must be protected without --include-real-dirs")
+        # With flag: real dir is removed.
+        args2 = build_parser().parse_args(
+            ["clean-backups", "--keep", "0", "--yes", "--include-real-dirs"])
+        with mock.patch("rice_switcher.log.append_audit"):
+            so2, se2 = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(so2), contextlib.redirect_stderr(se2):
+                rc2 = cmd_clean_backups(args2, self.roots, None)
+        self.assertEqual(rc2, 0, f"with --include-real-dirs rc must be 0; got {rc2}")
         self.assertFalse(os.path.lexists(backup_path),
-                         f"backup must be gone; still exists at {backup_path}")
+                         "real dir must be removed with --include-real-dirs")
         self.assertEqual(list_backups(self.roots.config_home), [])
 
 

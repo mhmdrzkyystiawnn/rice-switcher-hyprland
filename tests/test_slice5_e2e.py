@@ -127,12 +127,14 @@ class CleanBackupsE2E(unittest.TestCase):
         active_target = os.readlink(self.live)
         self.assertIn("/a/hypr", active_target)
 
-        rc, out, err = self._run_cli("clean-backups", "--keep", "1", "--yes")
+        rc, out, err = self._run_cli("clean-backups", "--keep", "1", "--yes",
+                                    "--include-real-dirs")
         self.assertEqual(rc, 0, err or out)
 
         remaining = list_backups(self.config_home)
         self.assertEqual([b.path for b in remaining], [newest],
                          "only the newest backup should remain")
+        self.assertEqual(remaining[0].kind, "symlink")
         self.assertFalse(os.path.lexists(older), "the older backup is gone")
 
         # State and the active rice's live link are untouched.

@@ -121,14 +121,14 @@ class RemoveTest(CleanBase):
     def test_yes_removes_all_candidates(self):
         self.backup_dir("20230101T000000_000")
         self.backup_dir("20230102T000000_000")
-        rc, out, text = self.run_direct(["clean-backups", "--yes"])
+        rc, out, text = self.run_direct(["clean-backups", "--yes", "--include-real-dirs"])
         self.assertEqual(rc, 0, text)
         self.assertEqual(self.names(), [])
 
     def test_keep_one_leaves_newest(self):
         self.backup_dir("20230101T000000_000")
         self.backup_dir("20230102T000000_000")
-        rc, out, text = self.run_direct(["clean-backups", "--keep", "1", "--yes"])
+        rc, out, text = self.run_direct(["clean-backups", "--keep", "1", "--yes", "--include-real-dirs"])
         self.assertEqual(rc, 0, text)
         self.assertEqual(self.names(), ["hypr.bak-20230102T000000_000"])
 
@@ -138,7 +138,7 @@ class RemoveTest(CleanBase):
         os.makedirs(keep, exist_ok=True)
         near = os.path.join(self.config_home, "hypr.bak-1")
         os.makedirs(near, exist_ok=True)
-        rc, out, text = self.run_direct(["clean-backups", "--yes"])
+        rc, out, text = self.run_direct(["clean-backups", "--yes", "--include-real-dirs"])
         self.assertEqual(rc, 0, text)
         self.assertTrue(os.path.isdir(keep))
         self.assertTrue(os.path.isdir(near))
@@ -168,7 +168,7 @@ class RemoveTest(CleanBase):
 
     def test_audit_written(self):
         self.backup_dir("20230101T000000_000")
-        self.run_direct(["clean-backups", "--yes"])
+        self.run_direct(["clean-backups", "--yes", "--include-real-dirs"])
         events = [e for e in self.audit_events() if e.get("action") == "cleanup"]
         self.assertEqual(len(events), 1)
         removed = events[0]["removed"]
@@ -197,7 +197,8 @@ class ConfirmTest(CleanBase):
 
     def test_confirm_yes_deletes(self):
         self.backup_dir("20230101T000000_000")
-        rc, out, text = self.run_direct(["clean-backups"], answers=["y"])
+        rc, out, text = self.run_direct(
+            ["clean-backups", "--include-real-dirs"], answers=["y"])
         self.assertEqual(rc, 0, text)
         self.assertEqual(self.names(), [])
 
@@ -236,7 +237,7 @@ class ValidationTest(CleanBase):
             return real(path, cfg)
 
         with mock.patch("rice_switcher.backups.remove_backup", side_effect=flaky):
-            rc, out, text = self.run_direct(["clean-backups", "--yes"])
+            rc, out, text = self.run_direct(["clean-backups", "--yes", "--include-real-dirs"])
         self.assertNotEqual(rc, 0, text)
         self.assertTrue(os.path.isdir(a))          # failed -> remains
         self.assertFalse(os.path.lexists(b))       # succeeded -> gone
