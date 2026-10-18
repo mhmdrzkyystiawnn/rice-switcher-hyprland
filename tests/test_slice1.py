@@ -309,6 +309,17 @@ class ValidateTest(unittest.TestCase):
         self.assertFalse(v.ok)
         self.assertTrue(any("outside allowed roots" in e for e in v.errors))
 
+    def test_validate_config_link_tilde_resolves_outside_allowed_roots(self):
+        # config_link = "~/.config/hypr" resolves to /home/iki/.config/hypr,
+        # which is outside RICE_CONFIG_HOME=/tmp/rs-field/config
+        # (HOME=/home/iki, RICE_CONFIG_HOME=/tmp/rs-field/config).
+        bad = Component(name="evil", type="bar", start="/bin/true", stop="/bin/true",
+                        config_link="~/.config/hypr")
+        m = _make_manifest(self.roots, "x", [bad])
+        v = validate_manifest(m, self.roots)
+        self.assertFalse(v.ok)
+        self.assertTrue(any("outside allowed roots" in e for e in v.errors))
+
     def test_validate_optional_skips_binary_check(self):
         # A component with optional=true should not produce a binary
         # warning even if its `start` binary is missing on PATH.
