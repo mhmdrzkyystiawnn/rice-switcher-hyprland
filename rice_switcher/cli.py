@@ -530,7 +530,7 @@ def cmd_switch(args, roots: Roots, log) -> int:
     )
     print(textwrap.dedent(f"""
         {plan_str(outcome.plan, roots)}
-        dry_run={outcome.dry_run}  snapshot={outcome.snapshot_ts}
+        no_op={outcome.dry_run}  snapshot={outcome.snapshot_ts}
         errors={outcome.errors}  warnings={outcome.warnings}
     """).strip())
     if outcome.errors:
