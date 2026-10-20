@@ -160,9 +160,15 @@ def compute_plan(
     target_name = target_manifest.meta.name
     current_name = current_manifest.meta.name if current_manifest else None
 
-    # The convention is <rice_home>/<name>. We derive rice_home from
-    # the manifest's source_path (which is <rice_home>/<name>/rice.toml).
-    target_rice_dir = os.path.dirname(os.path.dirname(target_manifest.source_path))
+    # The swap target for a config_link is
+    # `<rice_home>/<name>/<basename(config_link)>` (see switch.do_switch).
+    # So the "target rice directory" that a live symlink must point under
+    # is `<rice_home>/<name>` -- i.e. the rice dir, one level above
+    # rice.toml. Using `<rice_home>` here made every rice look like it
+    # already owned the link (elifouts' realpath is under rice_home), so
+    # switching between two rices that both declare the same config_link
+    # silently skipped the swap.
+    target_rice_dir = os.path.dirname(target_manifest.source_path)
 
     managed = load_managed_set(all_manifests)
 
