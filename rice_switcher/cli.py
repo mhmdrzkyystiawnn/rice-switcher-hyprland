@@ -397,9 +397,10 @@ def cmd_status(args, roots: Roots, log) -> int:
         else:
             state_label = "no-link"
             owner_label = "-"
-        # PIDS: first component with identity
+        # PIDS: prioritize non-compositor components, fallback to any component with identity
         pids_label = "-"
-        for c in m.components:
+        comps_to_check = [c for c in m.components if getattr(c, "type", "") != "compositor"] or m.components
+        for c in comps_to_check:
             ident = c.identity() if hasattr(c, "identity") else None
             if ident is None:
                 continue

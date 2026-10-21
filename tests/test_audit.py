@@ -692,10 +692,11 @@ class RollbackUpdatesStateTest(unittest.TestCase):
         self.assertEqual(st.current_rice, "a",
             f"after rollback state.current_rice should be 'a', got {st.current_rice!r}")
         # Live content should be from_a (captured at the moment of switch B).
-        # After rollback, `live` may be either a symlink or a directory
-        # containing a symlink to the rice directory; the bytes we
-        # read must come from `from_a`.
-        with open(os.path.join(self.live, "hypr", "h.txt")) as f:
+        # Live is restored as a symlink to the rice directory (a/hypr).
+        target_file = os.path.join(self.live, "h.txt")
+        if not os.path.exists(target_file):
+            target_file = os.path.join(self.live, "hypr", "h.txt")
+        with open(target_file) as f:
             self.assertEqual(f.read(), "from_a\n",
                 f"after rollback, live content should be 'from_a', got {f.read()!r}")
 

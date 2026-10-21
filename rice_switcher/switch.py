@@ -279,6 +279,7 @@ def do_switch(
                 # 9. Swap symlinks (PLAN.md §3.2 #8). This is the only
                 # filesystem change: the live config_link is pointed at
                 # <rice_home>/<name>/<basename(config_link)>.
+                swapped_links: list[tuple[str, str | None]] = []
                 for c in target_m.components:
                     if c.config_link:
                         n = os.path.abspath(os.path.expanduser(c.config_link))
@@ -286,6 +287,7 @@ def do_switch(
                         new_target = os.path.join(rice_dir, target_name,
                                                   os.path.basename(n))
                         backup = swap_symlink(n, new_target, roots=roots)
+                        swapped_links.append((n, backup))
 
                 # Lifecycle (PLAN.md §3.2 #9-#12): verify, reload,
                 # matugen, start, post-hooks.
@@ -362,25 +364,19 @@ def do_switch(
                             start_component(runtime, c, require_running=False)
                         except Exception:
                             pass
-                # Restore each config_link. Prefer undoing the exact swap
-                # (the `.bak-<ts>` made by swap_symlink); fall back to the
-                # pending snapshot when there is no backup (the link did
-                # not exist before the swap).
-                from .snapshot import _copy_tree_symlinks, undo_swap
-                for cl in config_links:
-                    n = os.path.abspath(os.path.expanduser(cl))
-                    if undo_swap(n, roots=roots):
-                        continue
-                    name = os.path.basename(n.rstrip("/")) or "config"
-                    src = os.path.join(roots.state_home, "rice-switcher",
-                                       "snapshot", f".pending-{ts}", name)
-                    if os.path.lexists(src):
+                # Restore each config_link that was swapped in this switch.
+                # If swap_symlink was never reached (e.g. stop/hooks/theme failed),
+                # swapped_links is empty and no live symlink is touched!
+                from .snapshot import undo_swap
+                for n, backup in reversed(swapped_links):
+                    if backup is not None:
+                        undo_swap(n, roots=roots, backup_path=backup)
+                    else:
                         if os.path.lexists(n):
                             if os.path.islink(n) or os.path.isfile(n):
                                 os.unlink(n)
                             else:
                                 shutil.rmtree(n)
-                        _copy_tree_symlinks(src, n)
                 # If the failed switch had reloaded Hyprland, reload the
                 # restored config back in; otherwise the compositor keeps
                 # running the target's (rolled-back) config in memory.

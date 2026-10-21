@@ -46,6 +46,9 @@ class SnapshotInfo:
     paths: list[str]   # config_link paths that were captured
 
 
+_last_ts: str = ""
+
+
 def _now_ts() -> str:
     """A timestamp safe for filesystem use and chronological sorting.
 
@@ -54,8 +57,14 @@ def _now_ts() -> str:
     that create seven snapshots in a row) can collide and break
     `os.rename` over a non-empty directory.
     """
-    now = time.time()
-    return time.strftime("%Y%m%dT%H%M%S", time.localtime(now)) + f"_{int((now % 1) * 1000):03d}"
+    global _last_ts
+    while True:
+        now = time.time()
+        ts = time.strftime("%Y%m%dT%H%M%S", time.localtime(now)) + f"_{int((now % 1) * 1000):03d}"
+        if ts > _last_ts:
+            _last_ts = ts
+            return ts
+        time.sleep(0.001)
 
 
 def list_committed(roots: Roots) -> list[str]:
@@ -110,16 +119,11 @@ def _copy_tree_symlinks(src: str, dst: str) -> None:
         os.makedirs(dst, exist_ok=True)
         return
     if os.path.islink(src):
-        # If the live config_link is itself a symlink to a target that
-        # doesn't exist (dangling), we still want to record the link.
-        # We materialise the link target inside the snapshot.
-        os.makedirs(dst, exist_ok=True)
+        # Preserve the symlink itself as dst.
         link_target = os.readlink(src)
-        # Use an absolute path so the snapshot is self-contained.
-        link_dst = os.path.join(dst, os.path.basename(src.rstrip("/")))
-        if not os.path.exists(link_dst):
-            os.symlink(os.path.abspath(os.path.join(os.path.dirname(src), link_target)),
-                       link_dst)
+        if not os.path.isabs(link_target):
+            link_target = os.path.abspath(os.path.join(os.path.dirname(src), link_target))
+        os.symlink(link_target, dst)
         return
     if os.path.isdir(src):
         shutil.copytree(src, dst, symlinks=True)
@@ -289,27 +293,28 @@ def restore(roots: Roots, ts: str) -> tuple[list[str], str | None]:
     rice_name: str | None = None
     paths: list[str] = []
     if os.path.isfile(manifest):
-        for raw in open(manifest, "r", encoding="utf-8"):
-            line = raw.rstrip("\n").rstrip("\r")
-            if not line.strip():
-                continue
-            if line.startswith("rice="):
-                # Audit fix S4: rice name is recorded for state restoration.
-                candidate = line[len("rice="):]
-                if candidate == "":
-                    # Present but empty: "no rice" before the switch.
-                    rice_name = ""
+        with open(manifest, "r", encoding="utf-8") as f:
+            for raw in f:
+                line = raw.rstrip("\n").rstrip("\r")
+                if not line.strip():
                     continue
-                # Validate before trusting it; the snapshot may have
-                # been hand-edited.
-                from .paths import validate_rice_name as _v
-                ok, _err = _v(candidate)
-                if ok:
-                    rice_name = candidate
-                # else: leave rice_name=None and let the caller handle
-                # it explicitly.
-                continue
-            paths.append(line)
+                if line.startswith("rice="):
+                    # Audit fix S4: rice name is recorded for state restoration.
+                    candidate = line[len("rice="):]
+                    if candidate == "":
+                        # Present but empty: "no rice" before the switch.
+                        rice_name = ""
+                        continue
+                    # Validate before trusting it; the snapshot may have
+                    # been hand-edited.
+                    from .paths import validate_rice_name as _v
+                    ok, _err = _v(candidate)
+                    if ok:
+                        rice_name = candidate
+                    # else: leave rice_name=None and let the caller handle
+                    # it explicitly.
+                    continue
+                paths.append(line)
     else:
         paths = [os.path.join(snap, d) for d in os.listdir(snap) if d != ".captured.txt"]
 
@@ -331,41 +336,9 @@ def restore(roots: Roots, ts: str) -> tuple[list[str], str | None]:
         # by looking up the basename in `.captured.txt`.
         # The destination is the recorded path itself.
         dst = entry
-        # Resolve a top-level symlink at `src` to its real directory.
-        # `_copy_tree_symlinks` preserves symlinks with their ORIGINAL
-        # target string, which may be relative. When `restore` then
-        # copies that entry to `dst` (which lives at the live config
-        # path), the relative target would resolve to the wrong place.
-        # The fix is: if `src` is a symlink to a directory, follow it
-        # once and treat the real directory as the source so that
-        # shutil.copytree copies its CONTENT (not the broken symlink).
-        real_src = src
-        if os.path.islink(src) and not os.path.isdir(src):
-            # symlink to a non-directory: use the original code path
-            # below.
-            pass
-        elif os.path.islink(src):
-            # symlink to a directory: follow it once for restore
-            try:
-                real_src = os.path.realpath(src)
-            except OSError:
-                real_src = src
-        if os.path.isdir(real_src):
-            # Replace dst (whether symlink, dir, or absent) with src.
-            if os.path.lexists(dst):
-                if os.path.islink(dst) or os.path.isfile(dst):
-                    os.unlink(dst)
-                else:
-                    shutil.rmtree(dst)
-            # symlinks=True preserves sub-symlinks (e.g. dangling
-            # symlinks in the live config) verbatim, with the same
-            # fixup applied via _copy_tree_symlinks.
-            shutil.copytree(real_src, dst, symlinks=True)
-        elif os.path.islink(src):
-            # top-level symlink to a non-directory (file or dangling).
-            # We must read the ORIGINAL target string (not the
-            # resolved path) and re-anchor it relative to src so the
-            # new symlink at `dst` resolves correctly.
+        # If `src` in snapshot is a symlink, restore it as a symlink!
+        # Do not convert a live symlink into a copied directory.
+        if os.path.islink(src):
             raw_target = os.readlink(src)
             src_dir = os.path.dirname(src)
             if os.path.isabs(raw_target):
@@ -373,12 +346,22 @@ def restore(roots: Roots, ts: str) -> tuple[list[str], str | None]:
             else:
                 target = os.path.normpath(os.path.join(src_dir, raw_target))
             if os.path.lexists(dst):
-                os.unlink(dst)
+                if os.path.islink(dst) or os.path.isfile(dst):
+                    os.unlink(dst)
+                else:
+                    shutil.rmtree(dst)
             os.symlink(target, dst)
-        elif os.path.isfile(real_src):
+        elif os.path.isdir(src):
+            if os.path.lexists(dst):
+                if os.path.islink(dst) or os.path.isfile(dst):
+                    os.unlink(dst)
+                else:
+                    shutil.rmtree(dst)
+            shutil.copytree(src, dst, symlinks=True)
+        elif os.path.isfile(src):
             if os.path.lexists(dst):
                 os.unlink(dst)
-            shutil.copy2(real_src, dst)
+            shutil.copy2(src, dst)
         restored.append(dst)
     return restored, rice_name
 
@@ -444,29 +427,37 @@ def swap_symlink(target: str, source: str, roots=None) -> str | None:
     return backup
 
 
-def undo_swap(target: str, roots=None) -> str | None:
+def undo_swap(target: str, roots=None, backup_path: str | None = None) -> str | None:
     """Undo a previous `swap_symlink(target, ...)`: remove the symlink
     at `target` and rename the `.bak-<ts>` back if present. Returns
     the backup path that was restored, or None if there was nothing to
     undo. When `roots` is provided, an audit event is recorded.
     """
-    parent = os.path.dirname(target)
-    base = os.path.basename(target)
-    backups: list[str] = []
-    try:
-        for entry in os.listdir(parent):
-            if entry.startswith(f"{base}.bak-"):
-                backups.append(entry)
-    except FileNotFoundError:
-        return None
-    if not backups:
-        return None
-    # Pick the most recent backup (lexicographic == chronological for ts).
-    backups.sort(reverse=True)
-    chosen = os.path.join(parent, backups[0])
+    if backup_path is not None:
+        chosen = backup_path
+        if not os.path.lexists(chosen):
+            return None
+    else:
+        parent = os.path.dirname(target)
+        base = os.path.basename(target)
+        backups: list[str] = []
+        try:
+            for entry in os.listdir(parent):
+                if entry.startswith(f"{base}.bak-"):
+                    backups.append(entry)
+        except FileNotFoundError:
+            return None
+        if not backups:
+            return None
+        # Pick the most recent backup (lexicographic == chronological for ts).
+        backups.sort(reverse=True)
+        chosen = os.path.join(parent, backups[0])
     old_target = os.readlink(target) if os.path.islink(target) else None
     if os.path.lexists(target):
-        os.unlink(target)
+        if os.path.islink(target) or os.path.isfile(target):
+            os.unlink(target)
+        else:
+            shutil.rmtree(target)
     os.rename(chosen, target)
     if roots is not None:
         from .log import append_audit

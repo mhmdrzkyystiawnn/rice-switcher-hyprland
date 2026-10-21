@@ -141,7 +141,7 @@ def find_pids_by_identity(
         if ident is None:
             continue
         exe, tokens = ident
-        if exe != executable:
+        if exe != executable and exe.lower() != executable.lower():
             continue
         if not argv_matches(tokens, argv_match, exact=exact):
             continue
@@ -186,7 +186,7 @@ def pid_matches_identity(
     if ident is None:
         return False
     exe, tokens = ident
-    if exe != executable:
+    if exe != executable and exe.lower() != executable.lower():
         return False
     return argv_matches(tokens, argv_match, exact=exact)
 
@@ -377,7 +377,7 @@ def probe_pids_by_identity(
         if ident is None:
             continue
         exe, tokens = ident
-        if exe != executable:
+        if exe != executable and exe.lower() != executable.lower():
             continue
         if not argv_matches(tokens, argv_match, exact=exact):
             continue
